@@ -1,0 +1,586 @@
+[% nosubmit = 1 %]
+[% PROCESS settings/header.html %]
+
+<style>
+	/* tabs: same look as the VLC pages */
+	ul.vlc-tabs { list-style: none; margin: 0 0 12px 0; padding: 0; border-bottom: 1px solid #999; overflow: hidden; }
+	ul.vlc-tabs li { float: left; margin: 0 2px -1px 0; width: 130px; }
+	ul.vlc-tabs li a { display: block; text-align: center; padding: 7px 0; border: 1px solid #999; border-bottom: 0; border-radius: 4px 4px 0 0; background: #e8e8e8; color: #333; text-decoration: none; cursor: pointer; }
+	ul.vlc-tabs li a:hover { background: #f4f4f4; }
+	ul.vlc-tabs li.vlc-tab-on a { background: #fff; font-weight: bold; border-bottom: 1px solid #fff; cursor: default; }
+
+	.vlc-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+	.vlc-row:last-child { margin-bottom: 0; }
+	.vlc-row label { font-weight: bold; }
+	#vlc_nav_msg:empty { display: none; }    /* an empty message must not take a gap at the end of the row: the list ends where the Input box ends */
+	table.vlc-kv td { padding: 1px 16px 1px 0; vertical-align: top; }
+	table.vlc-kv td:first-child { font-weight: bold; white-space: nowrap; }
+	.vlc-btn { width: 40px; height: 28px; margin: 4px 6px 0 0; padding: 0; cursor: pointer; vertical-align: middle; }
+	.vlc-btn:disabled { cursor: default; opacity: .4; }
+	.vlc-btn svg { display: block; margin: 0 auto; }
+	.vlc-bar { width: 240px; max-width: 100%; height: 8px; border: 1px solid currentColor; border-radius: 4px; overflow: hidden; }
+	.vlc-bar > div { height: 100%; width: 0; background: currentColor; opacity: .6; }
+
+	/* 8 lines of console font, the height does not change with the content */
+	.vlc-console { box-sizing: border-box; width: 420px; max-width: 100%; height: calc(8 * 1.35em + 12px); margin: 0; padding: 6px 10px; overflow: hidden; border: 1px solid #999; border-radius: 3px; background: #fafafa; color: #222; font-family: Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace; font-size: 13px; line-height: 1.35; white-space: pre; }
+	#vlc-status-light { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; background-color: gray; vertical-align: middle; }
+	#vlc-status-light[data-state="ok"]   { background-color: limegreen; }
+	#vlc-status-light[data-state="err"]  { background-color: red; }
+	#vlc-status-light[data-state="wait"] { background-color: orange; }
+
+	/* equalizer (Control tab) */
+	#vlc_equalizer {
+		padding:4px;
+		padding-bottom:2px;
+		width:40%;
+		min-width:360px;
+		border:2px solid #404040;
+	}
+	
+	.eq_frame {
+		border:2px solid #404040;
+		border-radius:2px;
+		background:#404040;
+	}
+	
+	.eq_content {
+		background:white;
+		border-radius:2px;
+		border:2px solid #404040;
+	}
+	
+	div.eq_band {
+		width:32px;
+		display:inline-block;
+		text-align:center;
+		position:relative;
+		line-height:26px;
+		vertical-align:middle;
+		color:white;
+	}
+	
+	.eq_band input[type='range'] {
+		transform:rotate(-90deg);
+		transform-origin:0 100%;
+		position:absolute;
+		left:24px;
+		bottom:8px;
+	}
+	
+	.eq_button
+	{
+		overflow:hidden;
+		background:rgba(44,64,84,0.9);
+		padding:6px 10px;
+		color:#ffffff;
+		cursor:pointer;
+		border-radius:6px;
+		border: none;
+		font: inherit;
+		margin:2px 2px 2px 8px;
+	}
+	
+	.eq_button:disabled { opacity:0.4; cursor:default; }
+</style>
+
+[% WRAPPER settingSection %]
+	<ul class="vlc-tabs" id="vlc_tabs">
+		<li class="vlc-tab-on" data-tab="player"><a href="#player">Player</a></li>
+		<li data-tab="control"><a href="#control">Control</a></li>
+	</ul>
+
+	<div class="vlc-panel" id="vlc_p_player" style="position:relative;">
+		[%# artwork of the playing item: top right of the Player tab, level with the Remote Control section, below the tabs; the whole image is shown, nothing cropped %]
+		<img id="vlc_cover" class="playericon" alt="" style="display:none;position:absolute;top:0;right:0;width:250px;height:250px;object-fit:contain;">
+
+		[% WRAPPER settingGroup title="Remote Control" desc="" %]
+			<span id="vlc-status-light" data-state="off"></span>
+			<span id="vlc-status-info" role="status" aria-live="polite">-</span>
+		[% END %]
+
+		[% WRAPPER settingGroup title="Now Playing" desc="" %]
+			<table class="vlc-kv">
+				<tr><td>State:</td><td id="np_state">-</td></tr>
+				<tr><td>Track:</td><td id="np_track">-</td></tr>
+				<tr><td>Time:</td><td><div class="vlc-row" style="margin:0;"><span id="np_time">-</span><div class="vlc-bar"><div id="np_bar"></div></div></div></td></tr>
+				<tr><td></td><td>
+					<button type="button" id="np_pause" class="vlc-btn" title="Pause" aria-label="Pause" disabled></button>
+					<button type="button" id="np_stop" class="vlc-btn" title="Stop" aria-label="Stop" disabled><svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="10" height="10"/></svg></button>
+				</td></tr>
+			</table>
+		[% END %]
+
+		[% WRAPPER settingGroup title="Status" desc="" %]
+			<div class="vlc-row" style="max-width:560px;">
+				<label for="vlc_input">Input:</label>
+				<input type="text" id="vlc_input" class="stdedit" readonly style="flex:1 1 auto;min-width:0;">
+			</div>
+		[% END %]
+
+		[% WRAPPER settingGroup title="Navigation" desc="" %]
+			<div class="vlc-row" style="flex-wrap:wrap;max-width:560px;">
+				<label for="vlc_chapter">Chapter:</label>
+				<select id="vlc_chapter"></select>
+				<label for="vlc_streams" style="margin-left:12px;">Streams:</label>
+				<select id="vlc_streams" style="flex:1 1 240px;min-width:0;"></select>
+				<span id="vlc_nav_msg" class="vlc-hint" role="status"></span>
+			</div>
+		[% END %]
+
+		[% WRAPPER settingGroup title="Statistics" desc="" %]
+			<pre id="vlc_stats" class="vlc-console"></pre>
+		[% END %]
+
+	</div>
+
+	<div class="vlc-panel" id="vlc_p_control" style="display:none;">
+		[% WRAPPER settingGroup title="Transcode" desc="PCM that ffmpeg writes, always stereo (downmix). Applies to the next track: it cannot be changed while a track is playing." %]
+			<table class="vlc-kv">
+				<tr><td><label for="tc_bits">Bit depth:</label></td><td><select id="tc_bits"><option value="16">16 bit</option><option value="24">24 bit</option></select></td></tr>
+				<tr><td><label for="tc_rate">Sample rate:</label></td><td><select id="tc_rate"><option value="44100">44100 Hz</option><option value="48000">48000 Hz</option><option value="96000">96000 Hz</option></select></td></tr>
+			</table>
+			<div id="tc_status" role="status" style="min-height:1.4em;margin-top:4px;font-size:90%;">&nbsp;</div>
+		[% END %]
+		[% bands = [ { freq => "60", index => 0 }, { freq => "170", index => 1 }, { freq => "310", index => 2 }, { freq => "600", index => 3 }, { freq => "1K", index => 4 }, { freq => "3K", index => 5 }, { freq => "6K", index => 6 }, { freq => "12K", index => 7 }, { freq => "14K", index => 8 }, { freq => "16K", index => 9 } ] %]
+		[% WRAPPER settingGroup title="Equalizer" desc="10-band equalizer applied by ffmpeg while it plays (volume and equalizer filters of its graph). It is kept for the next tracks." %]
+		<div id="vlc_equalizer">
+			<div class="eq_frame" style="text-align:center;">
+				<div>
+					[% FOREACH b IN bands %]<div class="eq_band">[% b.freq %]</div>[% END %]
+				</div>
+
+				<div class="eq_content" style="overflow:hidden;margin:-6px;">
+					[% FOREACH b IN bands %]<div class="eq_band" style="height:146px;"><input type="range" min="-20" max="20" value="0" step="0.1" id="eqband_[% b.index %]"></div>[% END %]
+				</div>
+
+				<div>
+					[% FOREACH b IN bands %]<div class="eq_band" id="eqatt_[% b.index %]">0.0</div>[% END %]
+				</div>
+
+				<div class="eq_content" style="line-height:24px;padding:2px 6px;overflow:hidden;margin:-6px;text-align:left;">
+					<span>Gain:</span>&nbsp;
+					<div style="display:inline-block;margin-bottom:-12px;">
+						<input style="width:140px;" type="range" min="-20" max="20" value="0" step="0.1" id="eq_gain">
+					</div>&nbsp;
+					<span id="eq_gain_disp" style="display:inline-block;width:32px;text-align:right;">0.0</span>dB
+				</div>
+			</div>
+
+			<div style="text-align:left;margin-top:4px;">
+				<div style="display:inline-block;line-height:20px;">
+					<label><input type="checkbox" id="equalizer_enable">&nbsp;<span>Equalizer</span></label>
+				</div>
+				<div style="display:inline-block;float:right;padding-top:4px;">
+					<button type="button" class="eq_button" id="eq_reset">Reset EQ</button>
+				</div>
+			</div>
+
+			<div id="eq_status" role="status" style="clear:both;min-height:1.4em;margin-top:4px;text-align:left;font-size:90%;">&nbsp;</div>
+		</div>
+		[% END %]
+	</div>
+
+[% END %]
+
+<script type="text/javascript">
+(function () {
+	'use strict';
+
+	// tabs: they only show and hide blocks of the page
+	var tabs = document.getElementById('vlc_tabs').getElementsByTagName('li');
+
+	function showTab(name) {
+		var known = false, i;
+		for (i = 0; i < tabs.length; i++) if (tabs[i].getAttribute('data-tab') === name) known = true;
+		if (!known) name = 'player';
+		for (i = 0; i < tabs.length; i++) {
+			var on = tabs[i].getAttribute('data-tab') === name;
+			tabs[i].className = on ? 'vlc-tab-on' : '';
+			document.getElementById('vlc_p_' + tabs[i].getAttribute('data-tab')).style.display = on ? '' : 'none';
+		}
+		try { sessionStorage.setItem('lyphile_ffmpeg_tab', name); } catch (e) {}
+	}
+	for (var t = 0; t < tabs.length; t++) {
+		tabs[t].onclick = function (ev) {
+			showTab(this.getAttribute('data-tab'));
+			if (ev && ev.preventDefault) ev.preventDefault();
+			return false;
+		};
+	}
+	// ---- green while ffmpeg runs for the player (Lyrion plays it and ffmpeg's report is complete), red when not ----------------
+	var PLAYER = "[% playerid | html %]";
+	var RC_URL = "[% webroot %]plugins/Lyphile/ffmpeg/rcstatus";
+	var light = document.getElementById('vlc-status-light'), info = document.getElementById('vlc-status-info');
+
+	var input = document.getElementById('vlc_input');
+
+	// the Input field shows the file name of the MRL (the full MRL is its tooltip)
+	function setInput(mrl) {
+		var name = mrl.substring(mrl.lastIndexOf('/') + 1);
+		try { name = decodeURIComponent(name); } catch (e) {}
+		input.value = name;
+		input.title = mrl;
+	}
+
+	// A dropdown filled with [ { id, text, selected } ], the selected one being what ffmpeg plays now.
+	// A list that did not change is left alone, so an open dropdown is not rebuilt; selecting in it
+	// does nothing yet.
+	function fillSelect(sel, list, force) {
+		list = list || [];
+		var key = JSON.stringify(list.map(function (it) { return [it.id, it.text]; }));
+		if (key !== sel.getAttribute('data-key')) {
+			sel.setAttribute('data-key', key);
+			sel.innerHTML = '';
+			list.forEach(function (it) {
+				var o = document.createElement('option');
+				o.value = it.id == null ? '' : it.id;
+				o.textContent = it.text;
+				sel.appendChild(o);
+			});
+		}
+		if (force || document.activeElement !== sel) {
+			sel.selectedIndex = -1;
+			list.forEach(function (it, i) { if (it.selected) sel.selectedIndex = i; });
+		}
+	}
+
+	// the statistics lines (ffmpeg's progress)
+	var statsBox = document.getElementById('vlc_stats');
+	function setStats(lines) { statsBox.textContent = (lines || []).join('\n'); }
+
+	// Now Playing: state, "artist - album - title" (what is missing is left out, with its dash),
+	// time / length and the bar
+	function clock(sec) {
+		sec = Math.max(0, Math.floor(sec));
+		var h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+		return (h ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (s < 10 ? '0' : '') + s;
+	}
+	// pause / stop: the pause button shows what a click does (pause while playing, resume while paused)
+	var ICON_PAUSE = '<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><rect x="3" y="3" width="3.5" height="10"/><rect x="9.5" y="3" width="3.5" height="10"/></svg>';
+	var ICON_PLAY  = '<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><polygon points="4,2.5 13,8 4,13.5"/></svg>';
+	var btnPause = document.getElementById('np_pause'), btnStop = document.getElementById('np_stop');
+	function setTransport(state) {
+		var live = state === 'playing' || state === 'paused';
+		btnPause.disabled = btnStop.disabled = !live;
+		btnPause.innerHTML = state === 'paused' ? ICON_PLAY : ICON_PAUSE;
+		var label = state === 'paused' ? 'Resume' : 'Pause';
+		btnPause.title = label;
+		btnPause.setAttribute('aria-label', label);
+	}
+
+	function setNow(now) {
+		now = now || {};
+		setTransport(now.state);
+		var has = function (v) { return v !== undefined && v !== null && v !== ''; };
+		document.getElementById('np_state').textContent = now.state || '-';
+		document.getElementById('np_track').textContent = [now.artist, now.album, now.title].filter(has).join(' - ') || '-';
+		var timeText = has(now.time) ? (has(now.length) && now.length > 0 ? clock(now.time) + ' / ' + clock(now.length) : clock(now.time)) : '-';
+		document.getElementById('np_time').textContent = timeText;
+		var pct = has(now.time) && now.length > 0 ? Math.min(100, Math.max(0, now.time / now.length * 100)) : 0;
+		document.getElementById('np_bar').style.width = pct + '%';
+	}
+
+	var chapters = document.getElementById('vlc_chapter'), streams = document.getElementById('vlc_streams');
+	var navMsg = document.getElementById('vlc_nav_msg');
+	var switching = false;      // an audio switch is under way: the polling leaves the lists alone
+
+	function setNavigation(res) {
+		res = res || {};
+		if (!res.streams) navMsg.textContent = '';
+		if (switching && res.streams) return;
+		fillSelect(chapters, res.chapters);
+		fillSelect(streams, res.streams);
+	}
+
+	// One request to a Lyphile::FFmpeg::Control endpoint
+	function api(name, params) {
+		var ctrl = new AbortController();
+		var timer = setTimeout(function () { ctrl.abort(); }, 8000);
+		params = Object.assign({ player: PLAYER }, params || {});
+		return fetch("[% webroot %]plugins/Lyphile/ffmpeg/" + name, {
+			method: 'POST',
+			cache: 'no-store',
+			signal: ctrl.signal,
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+			body: new URLSearchParams(params).toString()
+		}).then(function (r) {
+			if (!r.ok) throw new Error('HTTP ' + r.status);
+			return r.text();
+		}).then(function (txt) {
+			try { return JSON.parse(txt); } catch (e) { throw new Error('not JSON'); }
+		}).then(function (res) { clearTimeout(timer); return res; },
+		        function (e)   { clearTimeout(timer); throw e; });
+	}
+
+	// Choosing in a list: the list is locked with the choice shown, the backend switches and reads
+	// back what ffmpeg plays now, the list shows that and is unlocked again. Only one switch at a time.
+	function onSwitch(sel, endpoint, key, notDone) {
+		sel.onchange = function () {
+			var id = sel.value;
+			if (id === '' || switching) return;
+			switching = true;
+			sel.disabled = true;
+			navMsg.textContent = 'switching...';
+			api(endpoint, { id: id }).then(function (res) {
+				if (!res.ok) throw new Error(res.error || 'error');
+				fillSelect(sel, res[key], true);
+				navMsg.textContent = res.confirmed ? '' : notDone;
+			}).catch(function (e) {
+				navMsg.textContent = 'switch failed: ' + e.message;
+				sel.setAttribute('data-key', '');      // the next poll puts back what ffmpeg plays
+			}).then(function () {
+				switching = false;
+				sel.disabled = false;
+			});
+		};
+	}
+	onSwitch(streams,  'atrack',  'streams',  'ffmpeg did not switch to that stream');
+	onSwitch(chapters, 'chapter', 'chapters', 'ffmpeg did not switch to that chapter');
+
+	// state: ok | err | wait. Anything but ok clears what was reported.
+	// Artwork of the song Lyrion plays on this player (path given by the backend, original proportions, fitted in 250x250
+	// by the style). Loaded again when it changes, hidden when ffmpeg is not active or there is none.
+	var cover = document.getElementById('vlc_cover'), coverKey = null;
+	cover.onload  = function () { cover.style.display = ''; };
+	cover.onerror = function () { cover.style.display = 'none'; };
+	function setCover(path) {
+		if (!path) { cover.style.display = 'none'; coverKey = null; return; }
+		if (path === coverKey) return;
+		coverKey = path;
+		cover.src = "[% webroot %]" + path;
+	}
+
+	function setLight(state, text) {
+		light.setAttribute('data-state', state);
+		info.textContent = text;
+		if (state !== 'ok') { input.value = ''; input.title = ''; setNavigation(); setStats(); setNow(); setCover(''); }
+	}
+
+	var rcTimer = null, polling = false;
+	function pollSoon(ms) {
+		clearTimeout(rcTimer);
+		rcTimer = setTimeout(pollRc, ms);
+	}
+
+	// The buttons act on Lyrion's player (it pauses or stops, and passes that on to ffmpeg), then the
+	// page asks again soon to show the new state
+	function transport(action) {
+		btnPause.disabled = btnStop.disabled = true;
+		api('transport', { action: action }).then(function (res) {
+			if (!res.ok) throw new Error(res.error || 'error');
+		}).catch(function (e) {
+			setLight('wait', action + ' failed: ' + e.message);
+		}).then(function () { pollSoon(500); });
+	}
+	btnPause.onclick = function () { transport('pause'); };
+	btnStop.onclick  = function () { transport('stop'); };
+
+	function pollRc() {
+		if (polling) return;
+		polling = true;
+		var ctrl = new AbortController();
+		var timer = setTimeout(function () { ctrl.abort(); }, 4000);
+		fetch(RC_URL, {
+			method: 'POST',
+			cache: 'no-store',
+			signal: ctrl.signal,
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+			body: new URLSearchParams({ player: PLAYER }).toString()
+		}).then(function (r) {
+			if (!r.ok) throw new Error('HTTP ' + r.status);
+			return r.text();
+		}).then(function (txt) {
+			var res;
+			try { res = JSON.parse(txt); } catch (e) { throw new Error('not JSON'); }
+			if (!res.ok) throw new Error(res.error || 'error');
+			if (res.active) { setLight('ok', 'ffmpeg running'); setInput(res.input || ''); setNavigation(res); setStats(res.stats); setNow(res.now); setCover(res.now && res.now.cover); }
+			else setLight('err', 'ffmpeg not running');
+		}).catch(function (e) {
+			setLight('wait', 'cannot check: ' + e.message);
+		}).then(function () {
+			clearTimeout(timer);
+			polling = false;
+			pollSoon(document.hidden ? 10000 : 3000);
+		});
+	}
+	setLight('wait', 'checking...');
+	pollRc();
+
+	var savedTab = null;
+	try { savedTab = sessionStorage.getItem('lyphile_ffmpeg_tab'); } catch (e) {}
+	showTab(location.hash ? location.hash.substr(1) : savedTab);
+})();
+</script>
+
+<script type="text/javascript">
+(function () {
+	'use strict';
+
+	// Equalizer of the Control tab: sliders send one request per move (at most one every 100 ms while
+	// dragging, one more on release); the values ffmpeg reports are shown unless a control is being used.
+	var PLAYER = "[% playerid | html %]";
+	var bands  = document.querySelectorAll('.eq_band input[type="range"]');
+	var enable = document.getElementById('equalizer_enable');
+	var gain   = document.getElementById('eq_gain');
+	var reset  = document.getElementById('eq_reset');
+	var statusEl = document.getElementById('eq_status');
+	var pending = {}, busy = 0;
+
+	function fmt(v) { v = parseFloat(v).toFixed(1); return v == '-0.0' ? '0.0' : v; }
+	function setStatus(ok, text) { statusEl.style.color = ok ? '#2e9e44' : '#d33'; statusEl.textContent = text; }
+
+	function send(params) {
+		busy++;
+		return fetch('[% webroot %]plugins/Lyphile/ffmpeg/eq', {
+			method: 'POST',
+			cache: 'no-store',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+			body: new URLSearchParams(Object.assign({ player: PLAYER }, params)).toString()
+		}).then(function (r) {
+			if (!r.ok) throw new Error('HTTP ' + r.status);
+			return r.text();
+		}).then(function (t) {
+			var res;
+			try { res = JSON.parse(t); } catch (e) { throw new Error('not JSON'); }
+			if (res.ok) setStatus(true, 'Applied'); else setStatus(false, 'Error: ' + (res.error || 'failed'));
+			return res;
+		}).catch(function (e) {
+			setStatus(false, 'Error: ' + e.message);
+			return { ok: false };
+		}).then(function (res) { busy--; return res; });
+	}
+
+	function throttled(key, build) {
+		if (pending[key]) return;
+		pending[key] = setTimeout(function () { pending[key] = null; send(build()); }, 100);
+	}
+	function final(key, build) {
+		clearTimeout(pending[key]);
+		pending[key] = null;
+		send(build());
+	}
+
+	Array.prototype.forEach.call(bands, function (el) {
+		var index = parseInt(el.id.replace(/^\D+/g, ''), 10);
+		var build = function () { return { band: index, value: el.value }; };
+		el.addEventListener('input', function () {
+			document.getElementById('eqatt_' + index).textContent = fmt(el.value);
+			throttled('b' + index, build);
+		});
+		el.addEventListener('change', function () { final('b' + index, build); });
+	});
+
+	var buildGain = function () { return { gain: gain.value }; };
+	gain.addEventListener('input', function () {
+		document.getElementById('eq_gain_disp').textContent = fmt(gain.value);
+		throttled('gain', buildGain);
+	});
+	gain.addEventListener('change', function () { final('gain', buildGain); });
+
+	function sync() {
+		var on = enable.checked;
+		Array.prototype.forEach.call(bands, function (el) { el.disabled = !on; el.style.opacity = on ? '1.0' : '0.4'; });
+		gain.disabled = reset.disabled = !on;
+	}
+	enable.addEventListener('change', function () {
+		var on = enable.checked;
+		sync();
+		send({ eq: on ? 'on' : 'off' }).then(function (res) {
+			if (!res.ok) { enable.checked = !on; sync(); }
+		});
+	});
+
+	// force: the values are the answer to what the user just did (Reset EQ), so they are shown whatever has the focus
+	function show(eq, force) {
+		if (!eq) return;
+		if (!force) {
+			if (busy || Object.keys(pending).some(function (k) { return pending[k]; })) return;
+			if (document.activeElement === enable || document.activeElement === gain || document.activeElement === reset) return;
+		}
+		enable.checked = !!eq.enabled;
+		Array.prototype.forEach.call(bands, function (el) {
+			if (!force && document.activeElement === el) return;
+			var index = parseInt(el.id.replace(/^\D+/g, ''), 10);
+			el.value = eq.bands[index];
+			document.getElementById('eqatt_' + index).textContent = fmt(eq.bands[index]);
+		});
+		gain.value = eq.preamp;
+		document.getElementById('eq_gain_disp').textContent = fmt(eq.preamp);
+		sync();
+	}
+
+	reset.addEventListener('click', function () {
+		send({ reset: 1 }).then(function (res) { if (res.ok) show(res.eq, true); });
+	});
+
+	// the state ffmpeg reports comes with the poll of the Player tab: rcstatus is asked again here, only while
+	// the Control tab is shown
+	var panel = document.getElementById('vlc_p_control');
+	function poll() {
+		if (panel.style.display !== 'none' && !document.hidden) {
+			fetch('[% webroot %]plugins/Lyphile/ffmpeg/rcstatus', {
+				method: 'POST', cache: 'no-store',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+				body: new URLSearchParams({ player: PLAYER }).toString()
+			}).then(function (r) { return r.json(); }).then(function (res) { if (res.ok && res.active) show(res.eq); }).catch(function () {});
+		}
+		setTimeout(poll, 2000);
+	}
+	sync();
+	poll();
+})();
+</script>
+
+<script type="text/javascript">
+(function () {
+	'use strict';
+
+	// Transcode settings of the Control tab: saved when changed; disabled while VLC is running (a track plays
+	// or is paused). The saved values come with rcstatus, asked every 2 s while the Control tab is shown.
+	var PLAYER = "[% playerid | html %]";
+	var BASE   = "[% webroot %]plugins/Lyphile/ffmpeg/";
+	var bits = document.getElementById('tc_bits'), rate = document.getElementById('tc_rate'), statusEl = document.getElementById('tc_status');
+	var panel = document.getElementById('vlc_p_control');
+	var running = false;
+
+	function post(name, params) {
+		return fetch(BASE + name, {
+			method: 'POST', cache: 'no-store',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+			body: new URLSearchParams(Object.assign({ player: PLAYER }, params)).toString()
+		}).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
+	}
+
+	function show(res) {
+		running = !!res.active;
+		bits.disabled = rate.disabled = running;
+		if (res.tc && document.activeElement !== bits && document.activeElement !== rate) {
+			bits.value = res.tc.bits;
+			rate.value = res.tc.rate;
+		}
+	}
+
+	function save(params) {
+		post('tc', params).then(function (res) {
+			statusEl.style.color = res.ok ? '#2e9e44' : '#d33';
+			statusEl.textContent = res.ok ? 'Saved' : (res.error === 'playing' ? 'Not saved: a track is playing' : 'Error: ' + (res.error || 'failed'));
+			if (res.tc) show({ active: running, tc: res.tc });
+			else poll();
+		}).catch(function (e) { statusEl.style.color = '#d33'; statusEl.textContent = 'Error: ' + e.message; });
+	}
+	bits.onchange = function () { save({ bits: bits.value }); };
+	rate.onchange = function () { save({ rate: rate.value }); };
+
+	function poll() {
+		return post('rcstatus', {}).then(function (res) { if (res.ok) show(res); }).catch(function () {});
+	}
+	function loop() {
+		if (panel.style.display !== 'none' && !document.hidden) poll();
+		setTimeout(loop, 2000);
+	}
+	poll();
+	loop();
+})();
+</script>
+
+[% PROCESS settings/footer.html %]

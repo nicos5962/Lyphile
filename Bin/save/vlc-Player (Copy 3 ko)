@@ -1,0 +1,144 @@
+#!/bin/sh
+# vlc-Player, basic version: VLC plays the input file and writes raw PCM (s16le, 48 kHz, stereo)
+# to a named pipe, ffmpeg reads the pipe and writes
+#   /config/prefs/Lyphile/test.<ext>
+# in the format of the -f option (flac, pcm, wav, mp3; flac when it is missing). ffmpeg reads the
+# pipe at 1x (-readrate 1): the full pipe holds VLC back, so VLC plays at normal speed.
+# The pipe is /config/prefs/Lyphile/<player mac, dashes>.fifo, and VLC's remote control (oldrc
+# interface) listens on the unix socket /config/prefs/Lyphile/<player mac, dashes>.sock.
+# Nothing goes to stdout. The input
+# file is the LAST argument. VLC ends itself when the file is finished (--play-and-exit); the
+# script also kills VLC and ffmpeg on any exit and removes the pipe and the socket.
+#
+# Logs, one set per player, emptied at every start (<mac> with dashes):
+#   vlc-<mac>.log             what VLC prints
+#   ffmpeg-<mac>.log          what ffmpeg prints
+#   vlc-transcode-<mac>.log   everything else: this script's own messages
+
+DIR=/config/prefs/Lyphile
+mkdir -p "$DIR"
+
+# TEST: 1 = VLC writes the raw PCM straight to $DIR/test-vlc.pcm, no pipe and no ffmpeg, to check
+# the sound of VLC alone (play it with: ffplay -f s16le -ar 48000 -ac 2 test-vlc.pcm).
+# 0 = the normal path, VLC -> pipe -> ffmpeg -> test.<ext>.
+DIRECT=1
+
+# options of the convert rule (custom-convert.conf):
+#   -m <mac>        player id          -f <format>   flc | pcm | wav | mp3
+#   -M <mode>       sout | aout        -s <seconds>  start time
+#   -d <seconds>    duration           -B <kbps>     mp3 bitrate
+# The input file is what is left after the options. They are parsed only: nothing uses them yet.
+ARGS=$*
+MAC= FORMAT= MODE= START= DURATION= BITRATE= BAD=
+while getopts ':m:f:M:s:d:B:' opt; do
+	case $opt in
+		m) MAC=$OPTARG ;;
+		f) FORMAT=$OPTARG ;;
+		M) MODE=$OPTARG ;;
+		s) START=$OPTARG ;;
+		d) DURATION=$OPTARG ;;
+		B) BITRATE=$OPTARG ;;
+		:) BAD="$BAD missing value for -$OPTARG;" ;;
+		*) BAD="$BAD unknown option -$OPTARG;" ;;
+	esac
+done
+shift $((OPTIND - 1))
+for a in "$@"; do FILE=$a; done
+
+# log files of this player
+ID=$(echo "${MAC:-unknown}" | tr ':' '-')
+LOG=$DIR/vlc-transcode-$ID.log
+VLCLOG=$DIR/vlc-$ID.log
+FFLOG=$DIR/ffmpeg-$ID.log
+: > "$LOG"
+: > "$VLCLOG"
+: > "$FFLOG"
+
+# VLC wants a writable home for its config
+export HOME=/tmp/vlchome
+mkdir -p "$HOME"
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+log "start"
+log "args:    $ARGS"
+log "options: mac=$MAC format=$FORMAT mode=$MODE start=$START duration=$DURATION bitrate=$BITRATE"
+[ -n "$BAD" ] && log "option problems:$BAD"
+
+if [ ! -f "$FILE" ]; then
+	log "the last argument is not an existing file: '$FILE'"
+	exit 1
+fi
+log "input:   $FILE"
+
+# output format: file extension and ffmpeg options
+case ${FORMAT:-flac} in
+	flac|flc) EXT=flac; FMT_OPTS="-c:a flac -f flac" ;;
+	pcm)      EXT=pcm;  FMT_OPTS="-c:a pcm_s16le -f s16le" ;;
+	wav)      EXT=wav;  FMT_OPTS="-c:a pcm_s16le -f wav" ;;
+	mp3)      EXT=mp3;  FMT_OPTS="-c:a libmp3lame -b:a ${BITRATE:-192}k -f mp3" ;;
+	*)
+		log "unknown format '$FORMAT' (-f): use flac, pcm, wav or mp3"
+		exit 1
+		;;
+esac
+OUT=$DIR/test.$EXT
+rm -f "$OUT"
+FIFO=$DIR/$ID.fifo
+SOCK=$DIR/$ID.sock
+
+if [ "$DIRECT" = 1 ]; then
+	VLCOUT=$DIR/test-vlc.pcm
+	rm -f "$VLCOUT" "$SOCK"
+	log "DIRECT test: no pipe, no ffmpeg"
+	log "output:  $VLCOUT (raw s16le, 48000 Hz, 2 channels)"
+else
+	VLCOUT=$FIFO
+	log "output:  $OUT ($FMT_OPTS)"
+	log "pipe:    $FIFO"
+fi
+log "socket:  $SOCK (oldrc)"
+log "logs:    $VLCLOG $FFLOG"
+
+if [ "$DIRECT" != 1 ]; then
+	rm -f "$FIFO" "$SOCK"
+	if ! mkfifo "$FIFO" 2>> "$LOG"; then
+		log "cannot create the pipe $FIFO"
+		exit 1
+	fi
+
+	# ffmpeg first: it waits on the pipe until VLC opens it, and it ends when VLC closes it
+	ffmpeg -nostdin -hide_banner -v error -y -readrate 1 -f s16le -ar 48000 -ac 2 -i "$FIFO" -vn $FMT_OPTS "$OUT" \
+		>> "$FFLOG" 2>&1 &
+	FFMPEG=$!
+	log "ffmpeg started, pid $FFMPEG"
+fi
+
+cvlc -I dummy --no-dbus --no-video --no-sout-video --no-sout-spu --play-and-exit \
+	--extraintf=oldrc --rc-fake-tty --rc-unix="$SOCK" \
+	"$FILE" \
+	--sout "#transcode{acodec=s16l,channels=2,samplerate=48000}:std{access=file,mux=raw,dst=$VLCOUT}" \
+	>> "$VLCLOG" 2>&1 &
+VLC=$!
+log "vlc started, pid $VLC"
+
+trap 'kill -KILL $VLC $FFMPEG 2>/dev/null; rm -f "$FIFO" "$SOCK"' EXIT INT TERM
+
+if [ "$DIRECT" = 1 ]; then
+	# VLC ends itself at the end of the file
+	wait $VLC
+	RC=$?
+	log "vlc ended, exit $RC"
+else
+	# ffmpeg ends at the end of the audio (or when VLC dies); then VLC must not stay behind
+	wait $FFMPEG
+	RC=$?
+	log "ffmpeg ended, exit $RC"
+	kill -KILL $VLC 2>/dev/null
+	wait $VLC 2>/dev/null
+	log "vlc ended, exit $?"
+fi
+
+rm -f "$FIFO" "$SOCK"
+log "end"
+exit $RC

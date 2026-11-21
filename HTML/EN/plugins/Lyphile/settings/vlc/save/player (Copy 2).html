@@ -1,0 +1,158 @@
+[% nosubmit = 1 %]
+[% PROCESS settings/header.html %]
+
+<style>
+	/* tabs: same look as the VLC page */
+	ul.vlc-tabs { list-style: none; margin: 0 0 12px 0; padding: 0; border-bottom: 1px solid #999; overflow: hidden; }
+	ul.vlc-tabs li { float: left; margin: 0 2px -1px 0; width: 130px; }
+	ul.vlc-tabs li a { display: block; text-align: center; padding: 7px 0; border: 1px solid #999; border-bottom: 0; border-radius: 4px 4px 0 0; background: #e8e8e8; color: #333; text-decoration: none; cursor: pointer; }
+	ul.vlc-tabs li a:hover { background: #f4f4f4; }
+	ul.vlc-tabs li.vlc-tab-on a { background: #fff; font-weight: bold; border-bottom: 1px solid #fff; cursor: default; }
+
+	.vlc-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+	.vlc-row label { font-weight: bold; }
+	#vlc-status-light { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; background-color: gray; vertical-align: middle; }
+	#vlc-status-light[data-state="ok"]   { background-color: limegreen; }
+	#vlc-status-light[data-state="err"]  { background-color: red; }
+	#vlc-status-light[data-state="wait"] { background-color: orange; }
+</style>
+
+[% WRAPPER settingSection %]
+
+	<ul class="vlc-tabs" id="vlc_tabs">
+		<li class="vlc-tab-on" data-tab="player"><a href="#player">Player</a></li>
+		<li data-tab="control"><a href="#control">Control</a></li>
+	</ul>
+
+	<div class="vlc-panel" id="vlc_p_player">
+
+		[% WRAPPER settingGroup title="Remote Control" desc="" %]
+			<span id="vlc-status-light" data-state="off"></span>
+			<span id="vlc-status-info" role="status" aria-live="polite">-</span>
+		[% END %]
+
+		[% WRAPPER settingGroup title="Status" desc="" %]
+			<div class="vlc-row">
+				<label for="vlc_input">Input:</label>
+				<input type="text" id="vlc_input" class="stdedit" readonly style="flex:1 1 auto;min-width:0;">
+			</div>
+		[% END %]
+
+		[% WRAPPER settingGroup title="Navigation" desc="" %]
+			<div class="vlc-row">
+				<label for="vlc_chapter">Chapter:</label>
+				<select id="vlc_chapter"></select>
+				<label for="vlc_streams" style="margin-left:12px;">Streams:</label>
+				<select id="vlc_streams" style="flex:0 1 auto;min-width:0;max-width:360px;"></select>
+			</div>
+		[% END %]
+
+	</div>
+
+	<div class="vlc-panel" id="vlc_p_control" style="display:none;"></div>
+
+[% END %]
+
+<script type="text/javascript">
+(function () {
+	'use strict';
+
+	// tabs: they only show and hide blocks of the page
+	var tabs = document.getElementById('vlc_tabs').getElementsByTagName('li');
+
+	function showTab(name) {
+		var known = false, i;
+		for (i = 0; i < tabs.length; i++) if (tabs[i].getAttribute('data-tab') === name) known = true;
+		if (!known) name = 'player';
+		for (i = 0; i < tabs.length; i++) {
+			var on = tabs[i].getAttribute('data-tab') === name;
+			tabs[i].className = on ? 'vlc-tab-on' : '';
+			document.getElementById('vlc_p_' + tabs[i].getAttribute('data-tab')).style.display = on ? '' : 'none';
+		}
+		try { sessionStorage.setItem('lyphile_vlc_tab', name); } catch (e) {}
+	}
+	for (var t = 0; t < tabs.length; t++) {
+		tabs[t].onclick = function (ev) {
+			showTab(this.getAttribute('data-tab'));
+			if (ev && ev.preventDefault) ev.preventDefault();
+			return false;
+		};
+	}
+	// ---- oldrc interface: green while VLC listens on the player's socket, red when not ----------------
+	var PLAYER = "[% playerid | html %]";
+	var RC_URL = "[% webroot %]plugins/Lyphile/vlc/rcstatus";
+	var light = document.getElementById('vlc-status-light'), info = document.getElementById('vlc-status-info');
+
+	var input = document.getElementById('vlc_input');
+
+	// A dropdown filled with [ { id, text, selected } ], the selected one being what VLC plays now.
+	// A list that did not change is left alone, so an open dropdown is not rebuilt; selecting in it
+	// does nothing yet.
+	function fillSelect(sel, list) {
+		list = list || [];
+		var key = JSON.stringify(list.map(function (it) { return [it.id, it.text]; }));
+		if (key !== sel.getAttribute('data-key')) {
+			sel.setAttribute('data-key', key);
+			sel.innerHTML = '';
+			list.forEach(function (it) {
+				var o = document.createElement('option');
+				o.value = it.id == null ? '' : it.id;
+				o.textContent = it.text;
+				sel.appendChild(o);
+			});
+		}
+		if (document.activeElement !== sel) {
+			sel.selectedIndex = -1;
+			list.forEach(function (it, i) { if (it.selected) sel.selectedIndex = i; });
+		}
+	}
+
+	var chapters = document.getElementById('vlc_chapter'), streams = document.getElementById('vlc_streams');
+	function setNavigation(res) {
+		res = res || {};
+		fillSelect(chapters, res.chapters);
+		fillSelect(streams, res.streams);
+	}
+
+	// state: ok | err | wait. Anything but ok clears what VLC reported.
+	function setLight(state, text) {
+		light.setAttribute('data-state', state);
+		info.textContent = text;
+		if (state !== 'ok') { input.value = ''; setNavigation(); }
+	}
+
+	function pollRc() {
+		var ctrl = new AbortController();
+		var timer = setTimeout(function () { ctrl.abort(); }, 4000);
+		fetch(RC_URL, {
+			method: 'POST',
+			cache: 'no-store',
+			signal: ctrl.signal,
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+			body: new URLSearchParams({ player: PLAYER }).toString()
+		}).then(function (r) {
+			if (!r.ok) throw new Error('HTTP ' + r.status);
+			return r.text();
+		}).then(function (txt) {
+			var res;
+			try { res = JSON.parse(txt); } catch (e) { throw new Error('not JSON'); }
+			if (!res.ok) throw new Error(res.error || 'error');
+			if (res.active) { setLight('ok', 'oldrc interface active'); input.value = res.input || ''; setNavigation(res); }
+			else setLight('err', 'oldrc interface not active');
+		}).catch(function (e) {
+			setLight('wait', 'cannot check: ' + e.message);
+		}).then(function () {
+			clearTimeout(timer);
+			setTimeout(pollRc, document.hidden ? 10000 : 3000);
+		});
+	}
+	setLight('wait', 'checking...');
+	pollRc();
+
+	var savedTab = null;
+	try { savedTab = sessionStorage.getItem('lyphile_vlc_tab'); } catch (e) {}
+	showTab(location.hash ? location.hash.substr(1) : savedTab);
+})();
+</script>
+
+[% PROCESS settings/footer.html %]

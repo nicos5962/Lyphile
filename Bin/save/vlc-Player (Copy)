@@ -1,0 +1,70 @@
+#!/bin/sh
+# vlc-Player, first basic version: plays the input file with VLC and writes the audio to
+#   /config/prefs/Lyphile/test.flac     (log: /config/prefs/Lyphile/test.log)
+# Nothing goes to stdout. The input file is the LAST argument; any other argument given by the
+# convert rule is ignored. VLC ends itself when the file is finished (--play-and-exit); the
+# script also kills it on any exit.
+
+DIR=/config/prefs/Lyphile
+OUT=$DIR/test.flac
+LOG=$DIR/test.log
+
+mkdir -p "$DIR"
+: > "$LOG"
+rm -f "$OUT"
+
+# VLC wants a writable home for its config
+export HOME=/tmp/vlchome
+mkdir -p "$HOME"
+
+# options of the convert rule (custom-convert.conf):
+#   -m <mac>        player id          -f <format>   flc | pcm | wav | mp3
+#   -M <mode>       sout | aout        -s <seconds>  start time
+#   -d <seconds>    duration           -B <kbps>     mp3 bitrate
+# The input file is what is left after the options. They are parsed only: nothing uses them yet.
+ARGS=$*
+MAC= FORMAT= MODE= START= DURATION= BITRATE= BAD=
+while getopts ':m:f:M:s:d:B:' opt; do
+	case $opt in
+		m) MAC=$OPTARG ;;
+		f) FORMAT=$OPTARG ;;
+		M) MODE=$OPTARG ;;
+		s) START=$OPTARG ;;
+		d) DURATION=$OPTARG ;;
+		B) BITRATE=$OPTARG ;;
+		:) BAD="$BAD missing value for -$OPTARG;" ;;
+		*) BAD="$BAD unknown option -$OPTARG;" ;;
+	esac
+done
+shift $((OPTIND - 1))
+for a in "$@"; do FILE=$a; done
+
+if [ ! -f "$FILE" ]; then
+	echo "args: $ARGS" >> "$LOG"
+	echo "the last argument is not an existing file: '$FILE'" >> "$LOG"
+	exit 1
+fi
+
+{
+	echo "start:  $(date '+%F %T')"
+	echo "args:   $ARGS"
+	echo "input:  $FILE"
+	echo "options: mac=$MAC format=$FORMAT mode=$MODE start=$START duration=$DURATION bitrate=$BITRATE"
+	[ -n "$BAD" ] && echo "option problems:$BAD"
+	echo "output: $OUT"
+} >> "$LOG"
+
+cvlc -I dummy --no-dbus --no-video --no-sout-video --no-sout-spu --play-and-exit \
+	"$FILE" \
+	--sout "#transcode{acodec=flac,channels=2,samplerate=48000}:std{access=file,mux=raw,dst=$OUT}" \
+	>> "$LOG" 2>&1 &
+VLC=$!
+
+trap 'kill -KILL $VLC 2>/dev/null' EXIT INT TERM
+
+wait $VLC
+RC=$?
+
+kill -KILL $VLC 2>/dev/null
+echo "vlc exit: $RC at $(date '+%F %T')" >> "$LOG"
+exit $RC

@@ -1,0 +1,253 @@
+[% PROCESS settings/header.html %]
+
+<style>
+	/* tabs: own classes, text and borders in the page's normal colors */
+	ul.lf_tabs { list-style: none; margin: 0 0 12px 0; padding: 0; border-bottom: 1px solid #999; overflow: hidden; }
+	ul.lf_tabs li { float: left; margin: 0 2px -1px 0; width: 110px; }
+	ul.lf_tabs li a { display: flex; align-items: center; justify-content: center; height: 36px; box-sizing: border-box; border: 1px solid #999; border-bottom: 0; border-radius: 4px 4px 0 0; background: #e8e8e8; color: #333; text-decoration: none; cursor: pointer; }
+	ul.lf_tabs li a:hover { background: #f4f4f4; }
+	ul.lf_tabs li.lf_tab_on a { background: #fff; font-weight: bold; border-bottom: 1px solid #fff; cursor: default; }
+	ul.lf_tabs li a img { max-height: 26px; max-width: 90px; width: auto; height: auto; }
+	ul.lf_tabs li:not(.lf_tab_on) a img { opacity: .7; }
+</style>
+
+[% MACRO binary_table(list) BLOCK %]
+	<table>
+	[% FOREACH b IN list %]
+		<tr>
+			<td style="padding-right:16px;white-space:nowrap;"><b>[% b.name | html %]:</b></td>
+			<td>
+				[% IF b.ok == 'yes' %]<span style="color:green;">Found</span>[% ELSE %]<span style="color:red;">Missing</span>[% END %]
+				[% IF b.version %] &ndash; v[% b.version | html %][% END %]
+				[% IF b.path %] &ndash; [% b.path | html %][% END %]
+				<br><small>[% b.desc | html %]</small>
+			</td>
+		</tr>
+	[% END %]
+	</table>
+[% END %]
+
+[% WRAPPER settingSection %]
+
+	<ul class="lf_tabs" id="lf_tabs">
+		<li class="lf_tab_on" data-tab="settings"><a href="#settings">Settings</a></li>
+		<li data-tab="ffmpeg"><a href="#ffmpeg" title="ffmpeg"><img src="[% webroot %]plugins/Lyphile/html/images/ffmpeg.svg" alt="ffmpeg"></a></li>
+		<li data-tab="vlc"><a href="#vlc" title="VLC"><img src="[% webroot %]plugins/Lyphile/html/images/vlc.svg" alt="VLC"></a></li>
+		<li data-tab="mpv"><a href="#mpv" title="mpv"><img src="[% webroot %]plugins/Lyphile/html/images/mpv.svg" alt="mpv"></a></li>
+	</ul>
+
+	<div class="lf_panel" id="lf_settings">
+		[% WRAPPER settingGroup title="Binaries" desc="Tools the helper scripts need" %]
+			[% binary_table(general_bins) %]
+		[% END %]
+
+		[% WRAPPER settingGroup title="Log files" desc="Shows the selected log file in a new window" %]
+			<select id="log_type">
+				[% FOREACH log IN logs %]
+					<option value="[% log.url | html %]">[% log.label | html %]</option>
+				[% END %]
+			</select>
+			<button type="button" onclick="window.open('[% webroot %]' + document.getElementById('log_type').value, 'log');">View</button>
+		[% END %]
+
+		[% WRAPPER settingGroup title="Select Player" desc="Program of the plugin's Bin folder, one per player; the types of file it takes over (audio: flac, mp3, wav, ape ... / dvd: iso, dvd / video: mkv, mpg, ts ...) and the formats it converts to. A type that is not ticked, and none, keep the stock transcoding rules" %]
+			<table>
+			[% FOREACH d IN devices %]
+				<tr>
+					<td style="padding-right:16px;white-space:nowrap;"><b>[% d.name | html %]:</b></td>
+					<td style="padding-right:16px;">[% d.mac | html %]</td>
+					<td style="white-space:nowrap;padding-right:16px;" class="lf_ov">
+						<label title="audio files: flac, mp3, wav, wavpack, ape ..."><input type="checkbox" name="ov_audio_[% d.mac | html %]" value="1"[% ' checked' IF d.ov_audio %]> audio</label>
+						<label style="margin-left:8px;" title="DVD images and folders: iso, dvd"><input type="checkbox" name="ov_dvd_[% d.mac | html %]" value="1"[% ' checked' IF d.ov_dvd %]> dvd</label>
+						<label style="margin-left:8px;" title="video files: mkv, mpg, ts, avi ..."><input type="checkbox" name="ov_video_[% d.mac | html %]" value="1"[% ' checked' IF d.ov_video %]> video</label>
+					</td>
+					<td>
+						<select name="selected_player_[% d.mac | html %]" class="lf_player_sel">
+							<option value="">none</option>
+							[% FOREACH bin IN player_bins %]
+								<option value="[% bin | html %]"[% ' selected' IF bin == d.player_bin %]>[% bin | html %]</option>
+							[% END %]
+						</select>
+					</td>
+					<td style="white-space:nowrap;" class="lf_tc">
+						<label><input type="checkbox" name="tc_mp3_[% d.mac | html %]" value="1"[% ' checked' IF d.tc_mp3 %]> mp3</label>
+						<label style="margin-left:8px;"><input type="checkbox" name="tc_flc_[% d.mac | html %]" value="1"[% ' checked' IF d.tc_flc %]> flc</label>
+						<label style="margin-left:8px;"><input type="checkbox" name="tc_pcm_[% d.mac | html %]" value="1"[% ' checked' IF d.tc_pcm %]> pcm</label>
+					</td>
+				</tr>
+			[% END %]
+			</table>
+		[% END %]
+	</div>
+
+	<div class="lf_panel" id="lf_ffmpeg" style="display:none;">
+
+	[% WRAPPER settingGroup title="Binaries" desc="" %]
+		[% binary_table(ffmpeg_bins) %]
+	[% END %]
+
+	[% IF ffmpeg_conf %]
+	[% WRAPPER settingGroup title="Build options" desc="Configure line of the ffmpeg found above" %]
+		<textarea readonly rows="5" cols="70" style="font-family:monospace;font-size:85%;">[% ffmpeg_conf | html %]</textarea>
+	[% END %]
+	[% END %]
+
+	[% WRAPPER settingGroup title="Next zmq port" desc="Port tried first for the next new player" %]
+		<input type="text" class="stdedit" name="zmq_next_port" value="[% zmq_next_port | html %]" size="8">
+	[% END %]
+
+	[% WRAPPER settingGroup title="zmq port assignments" desc="One port per connected player on 127.0.0.1 (1024-65535), used by the azmq filter" %]
+		<table>
+		[% FOREACH d IN devices %]
+			<tr>
+				<td style="padding-right:16px;white-space:nowrap;"><b>[% d.name | html %]:</b></td>
+				<td style="padding-right:16px;">[% d.mac | html %]</td>
+				<td>tcp://127.0.0.1:<input type="text" class="stdedit" name="zmq_port_[% d.mac | html %]" value="[% d.zmq_port | html %]" size="6"></td>
+			</tr>
+		[% END %]
+		</table>
+	[% END %]
+
+	</div>
+
+	<div class="lf_panel" id="lf_vlc" style="display:none;">
+
+	[% WRAPPER settingGroup title="Binaries" desc="" %]
+		[% binary_table(vlc_bins) %]
+	[% END %]
+
+	[% WRAPPER settingGroup title="Processes" desc="Force kill (SIGKILL) every vlc process running on the system that Lyrion may signal. Players that are playing through VLC stop." %]
+		<button type="button" id="lf_kill_vlc">Kill all VLC processes</button>
+		<span id="lf_kill_vlc_result" role="status" style="margin-left:10px;"></span>
+	[% END %]
+
+	[% WRAPPER settingGroup title="Next HTTP port" desc="Port tried first for the next new player (--http-port)" %]
+		<input type="text" class="stdedit" name="vlc_next_port" value="[% vlc_next_port | html %]" size="8">
+	[% END %]
+
+	[% WRAPPER settingGroup title="HTTP interface assignments" desc="One port and password per player. VLC is started with --extraintf=http --http-host=127.0.0.1 --http-port=PORT --http-password=PASSWORD" %]
+		<table>
+		[% FOREACH d IN devices %]
+			<tr>
+				<td style="padding-right:16px;white-space:nowrap;"><b>[% d.name | html %]:</b></td>
+				<td style="padding-right:16px;">[% d.mac | html %]</td>
+				<td style="padding-right:16px;">127.0.0.1:<input type="text" class="stdedit" name="vlc_port_[% d.mac | html %]" value="[% d.vlc_port | html %]" size="6"></td>
+				<td>password <input type="text" class="stdedit" name="vlc_password_[% d.mac | html %]" value="[% d.vlc_password | html %]" size="14"></td>
+			</tr>
+		[% END %]
+		</table>
+	[% END %]
+
+	</div>
+
+	<div class="lf_panel" id="lf_mpv" style="display:none;">
+
+	[% WRAPPER settingGroup title="Binaries" desc="" %]
+		[% binary_table(mpv_bins) %]
+	[% END %]
+
+	[% WRAPPER settingGroup title="Processes" desc="Force kill (SIGKILL) every mpv process running on the system that Lyrion may signal. Players that are playing through mpv stop." %]
+		<button type="button" id="lf_kill_mpv">Kill all mpv processes</button>
+		<span id="lf_kill_mpv_result" role="status" style="margin-left:10px;"></span>
+	[% END %]
+
+	[% WRAPPER settingGroup title="Socket directory" desc="Folder for the per-player sockets of --input-ipc-server (absolute path)" %]
+		<input type="text" class="stdedit" name="mpv_ipc_dir" value="[% mpv_ipc_dir | html %]" size="40">
+	[% END %]
+
+	[% WRAPPER settingGroup title="IPC server assignments" desc="One unix socket per player. mpv is started with --idle=yes --no-video --input-ipc-server=SOCKET" %]
+		<table>
+		[% FOREACH d IN devices %]
+			<tr>
+				<td style="padding-right:16px;white-space:nowrap;"><b>[% d.name | html %]:</b></td>
+				<td style="padding-right:16px;">[% d.mac | html %]</td>
+				<td><input type="text" class="stdedit" name="mpv_ipc_[% d.mac | html %]" value="[% d.mpv_ipc | html %]" size="48"></td>
+			</tr>
+		[% END %]
+		</table>
+	[% END %]
+
+	</div>
+[% END %]
+
+<script type="text/javascript">
+(function () {
+	// Tabs only show and hide blocks of the same form: every field is still submitted by Save.
+	var tabs = document.getElementById('lf_tabs').getElementsByTagName('li');
+	var names = ['settings', 'ffmpeg', 'vlc', 'mpv'];
+
+	function show(name) {
+		if (names.indexOf(name) < 0) name = 'settings';
+		for (var i = 0; i < tabs.length; i++) {
+			var on = tabs[i].getAttribute('data-tab') === name;
+			tabs[i].className = on ? 'lf_tab_on' : '';
+			document.getElementById('lf_' + tabs[i].getAttribute('data-tab')).style.display = on ? '' : 'none';
+		}
+		try { sessionStorage.setItem('lyphile_tab', name); } catch (e) {}
+	}
+
+	for (var i = 0; i < tabs.length; i++) {
+		tabs[i].onclick = function (ev) {
+			show(this.getAttribute('data-tab'));
+			if (ev && ev.preventDefault) ev.preventDefault();
+			return false;
+		};
+	}
+
+	// stay on the same tab after Save (the page reloads)
+	var saved = null;
+	try { saved = sessionStorage.getItem('lyphile_tab'); } catch (e) {}
+	show(location.hash ? location.hash.substr(1) : saved);
+})();
+
+(function () {
+	// "none" selected for a player: its format checkboxes are cleared and disabled
+	var sels = document.getElementsByClassName('lf_player_sel');
+	function sync(sel) {
+		var row = sel.parentNode.parentNode;
+		var boxes = Array.prototype.slice.call(row.getElementsByClassName('lf_tc')[0].getElementsByTagName('input'))
+			.concat(Array.prototype.slice.call(row.getElementsByClassName('lf_ov')[0].getElementsByTagName('input')));
+		for (var i = 0; i < boxes.length; i++) {
+			if (!sel.value) boxes[i].checked = false;
+			boxes[i].disabled = !sel.value;
+		}
+	}
+	for (var i = 0; i < sels.length; i++) {
+		sels[i].onchange = function () { sync(this); };
+		sync(sels[i]);
+	}
+})();
+
+(function () {
+	// "Kill all <program> processes" buttons: one POST, the answer says how many were killed
+	function killButton(name, label) {
+		var btn = document.getElementById('lf_kill_' + name), out = document.getElementById('lf_kill_' + name + '_result');
+		if (!btn) return;
+		btn.onclick = function () {
+			if (!confirm('Force kill all ' + label + ' processes on this system?')) return;
+			btn.disabled = true;
+			out.textContent = '...';
+			fetch('[% webroot %]plugins/Lyphile/kill' + name, {
+				method: 'POST',
+				cache: 'no-store',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+				body: ''
+			}).then(function (r) {
+				if (!r.ok) throw new Error('HTTP ' + r.status);
+				return r.text();
+			}).then(function (txt) {
+				var res;
+				try { res = JSON.parse(txt); } catch (e) { throw new Error('not JSON: ' + txt.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120)); }
+				out.textContent = res.found === 0 ? 'No ' + label + ' process found.' :
+					'Killed ' + res.killed + ' of ' + res.found + ' ' + label + ' process(es)' + (res.killed < res.found ? ' (the rest belong to another user).' : '.');
+			}).catch(function (e) {
+				out.textContent = 'Failed: ' + e.message;
+			}).then(function () { btn.disabled = false; });
+		};
+	}
+	killButton('vlc', 'VLC');
+	killButton('mpv', 'mpv');
+})();
+</script>
+
+[% PROCESS settings/footer.html %]

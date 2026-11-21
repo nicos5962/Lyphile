@@ -1,0 +1,205 @@
+[% nosubmit = 1 %]
+[% PROCESS settings/header.html %]
+
+<style>
+#equalizer {
+	padding:4px;
+	padding-bottom:2px;
+	width:40%;
+	min-width:360px;
+	border:2px solid #404040;
+}
+
+.eq_frame {
+	border:2px solid #404040;
+	border-radius:2px;
+	background:#404040;
+}
+
+.eq_content {
+	background:white;
+	border-radius:2px;
+	border:2px solid #404040;
+}
+
+div.eq_band {
+	width:32px;
+	display:inline-block;
+	text-align:center;
+	position:relative;
+	line-height:26px;
+	vertical-align:middle;
+	color:white;
+}
+
+.eq_band input[type='range'] {
+	transform:rotate(-90deg);
+	transform-origin:0 100%;
+	position:absolute;
+	left:24px;
+	bottom:8px;
+}
+
+.eq_button
+{
+	overflow:hidden;
+	background:rgba(44,64,84,0.9);
+	padding:6px 10px;
+	color:#ffffff;
+	cursor:pointer;
+	border-radius:6px;
+	border: none;
+	font: inherit;
+	margin:2px 2px 2px 8px;
+}
+
+.eq_button:disabled { opacity:0.4; cursor:default; }
+</style>
+
+[% WRAPPER settingSection %]
+	[% WRAPPER settingGroup title="Equalizer" desc="" %]
+	<div id="equalizer">
+		<div class="eq_frame" style="text-align:center;">
+			<div>
+				[% FOREACH b IN bands %]<div class="eq_band">[% b.freq %]</div>[% END %]
+			</div>
+
+			<div class="eq_content" style="overflow:hidden;margin:-6px;">
+				[% FOREACH b IN bands %]<div class="eq_band" style="height:146px;"><input type="range" min="-20" max="20" value="[% b.att %]" step="0.1" id="eqband_[% b.index %]"></div>[% END %]
+			</div>
+
+			<div>
+				[% FOREACH b IN bands %]<div class="eq_band" id="eqatt_[% b.index %]">[% b.att %]</div>[% END %]
+			</div>
+
+			<div class="eq_content" style="line-height:24px;padding:2px 6px;overflow:hidden;margin:-6px;text-align:left;">
+				<span>Gain:</span>&nbsp;
+				<div style="display:inline-block;margin-bottom:-12px;">
+					<input style="width:140px;" type="range" min="-65" max="15" value="[% eq_gain %]" step="0.1" id="eq_gain" name="eq_gain">
+				</div>&nbsp;
+				<span id="eq_gain_disp" style="display:inline-block;width:32px;text-align:right;">[% eq_gain %]</span>dB
+				<span style="display:inline-block;float:right;text-align:right;"><span style="margin-right:1px;">Peak:</span><span id="eq_peak"><span id="eq_peak_disp" style="margin-right:2px;">-</span>dB</span></span>
+			</div>
+		</div>
+
+		<div style="text-align:left;margin-top:4px;">
+			<div style="display:inline-block;line-height:20px;">
+				<label><input type="checkbox" id="equalizer_enable" [% 'checked' IF eq_enabled %]>&nbsp;<span>Equalizer</span></label><br>
+				<label><input type="checkbox" id="convolution_enable" disabled>&nbsp;<span>Convolution filters</span></label>
+			</div>
+
+			<div style="display:inline-block;float:right;padding-top:4px;">
+				<button type="button" class="eq_button" id="eq_reset">Reset EQ</button>
+			</div>
+		</div>
+
+		<div id="eq_status" role="status" style="clear:both;min-height:1.4em;margin-top:4px;text-align:left;font-size:90%;">&nbsp;</div>
+	</div>
+	[% END %]
+[% END %]
+
+<script type="text/javascript">
+(function () {
+	var PLAYER = "[% playerid | html %]";
+	var bands  = document.querySelectorAll('.eq_band input[type="range"]');
+	var enable = document.getElementById('equalizer_enable');
+	var gain   = document.getElementById('eq_gain');
+	var reset  = document.getElementById('eq_reset');
+	var statusEl = document.getElementById('eq_status');
+	var pending = {};
+
+	function fmt(v) { v = parseFloat(v).toFixed(1); return v == '-0.0' ? '0.0' : v; }
+
+	function setStatus(ok, text) {
+		statusEl.style.color = ok ? '#2e9e44' : '#d33';
+		statusEl.textContent = text;
+	}
+
+	// One request to the backend: it runs zmqsend and stores the value only if that worked.
+	function send(params) {
+		var body = new URLSearchParams(Object.assign({ player: PLAYER }, params));
+		return fetch('/plugins/Lyphile/eq/set', {
+			method: 'POST',
+			cache: 'no-store',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
+			body: body.toString()
+		}).then(function (r) {
+			if (!r.ok) throw new Error('HTTP ' + r.status);
+			return r.text().then(function (t) {
+				try { return JSON.parse(t); }
+				catch (e) { throw new Error('not JSON: ' + t.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120)); }
+			});
+		}).then(function (res) {
+			if (res.ok) setStatus(true, 'Applied');
+			else setStatus(false, 'Error: ' + (res.error || res.message || 'failed'));
+			return res;
+		}).catch(function (e) {
+			setStatus(false, 'Error: ' + e.message);
+			return { ok: false };
+		});
+	}
+
+	// While a slider moves ("input"): at most one request every 100 ms, with the latest value.
+	// One more goes out when it is released ("change").
+	function throttled(key, build) {
+		if (pending[key]) return;
+		pending[key] = setTimeout(function () { pending[key] = null; send(build()); }, 100);
+	}
+	function final(key, build) {
+		clearTimeout(pending[key]);
+		pending[key] = null;
+		send(build());
+	}
+
+	// Only user events send anything. The initial values are written by the server into the
+	// markup, so opening the page does not touch ffmpeg.
+	Array.prototype.forEach.call(bands, function (el) {
+		var index = parseInt(el.id.replace(/^\D+/g, ''), 10);
+		var build = function () { return { band: index, value: el.value }; };
+		el.addEventListener('input', function () {
+			document.getElementById('eqatt_' + index).textContent = fmt(el.value);
+			throttled('b' + index, build);
+		});
+		el.addEventListener('change', function () { final('b' + index, build); });
+	});
+
+	var buildGain = function () { return { gain: gain.value }; };
+	gain.addEventListener('input', function () {
+		document.getElementById('eq_gain_disp').textContent = fmt(gain.value);
+		throttled('gain', buildGain);
+	});
+	gain.addEventListener('change', function () { final('gain', buildGain); });
+
+	function sync() {
+		var on = enable.checked;
+		Array.prototype.forEach.call(bands, function (el) {
+			el.disabled = !on;
+			el.style.opacity = on ? '1.0' : '0.4';
+		});
+		gain.disabled = reset.disabled = !on;
+	}
+	enable.addEventListener('change', function () {
+		var on = enable.checked;
+		sync();
+		send({ eq: on ? 'on' : 'off' }).then(function (res) {
+			if (!res.ok) { enable.checked = !on; sync(); }   // zmqsend failed: back to the real state
+		});
+	});
+	sync();
+
+	reset.addEventListener('click', function () {
+		send({ reset: 1 }).then(function (res) {
+			if (!res.ok) return;
+			Array.prototype.forEach.call(bands, function (el) {
+				var index = parseInt(el.id.replace(/^\D+/g, ''), 10);
+				el.value = 0;   // setting a value in code fires no event: nothing is sent
+				document.getElementById('eqatt_' + index).textContent = '0.0';
+			});
+			gain.value = 0;
+			document.getElementById('eq_gain_disp').textContent = '0.0';
+		});
+	});
+})();
+</script>
+
+[% PROCESS settings/footer.html %]

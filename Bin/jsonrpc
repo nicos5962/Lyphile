@@ -1,0 +1,37 @@
+#! /bin/bash
+# jsonrpc: a request to Lyrion's JSON-RPC from a helper script, for example the preferences of a
+# player. The server address is the file "jsonrpc" that the plugin writes into
+# /config/prefs/Lyphile at start (see Plugin.pm).
+#
+#   jsonrpc [-q] [<player mac>] <command> [<parameter> ...]
+#
+#   jsonrpc ae:40:15:93:94:77 playerpref plugin.lyphile:mpv_ipc_server '?'
+#       -> {"id":1,"method":"slim.request","result":{"_p2":"/tmp/lyphile-mpv/ae-40-....sock"}, ...}
+#
+#   -q   no output (for commands that only do something)
+#
+# The value of a preference is .result._p2 of the answer:  | jq -r '.result._p2 // empty'
+
+[[ "$1" = "undefined" ]] && exit
+
+jsonrpc=$(cat "${LYPHILE_BASEDIR:-/config/prefs/Lyphile}/jsonrpc" 2> /dev/null)
+[[ -z "$jsonrpc" ]] && exit
+
+[[ "$1" = "-q" ]] && output="/dev/null" && shift || output="-"
+
+mac=${1,,}
+[[ "${mac}" =~ ^([0-9a-f]{2}:){5}([0-9a-f]{2})$ ]] && shift || mac=""
+
+[[ $# -gt 0 ]] || exit
+
+params="\"${mac}\",["
+while true
+do
+	params+='"'"$1"'"'
+	shift
+	[[ $# -eq 0 ]] && break || params+=","
+done
+params+="]"
+
+req='{"id":1,"method":"slim.request","params":['"${params}"']}'
+curl -sX POST "${jsonrpc}" -d "${req}" -o "${output}" 2> /dev/null

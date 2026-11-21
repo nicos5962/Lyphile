@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+
+<extension>
+	<name>PLUGIN_LYPHILE</name>
+	<module>Plugins::Lyphile::Plugin</module>
+	<version>1.0</version>
+	<description>PLUGIN_LYPHILE_DESC</description>
+	<creator>Lyphile</creator>
+	<defaultState>enabled</defaultState>
+	<icon>plugins/Lyphile/html/images/lyphile-icon.png</icon>
+	<optionsURL>plugins/Lyphile/settings/basic.html</optionsURL>
+	<type>2</type><!-- type=extension -->
+	<targetApplication>
+		<id>SlimServer</id>
+		<minVersion>9.0</minVersion>
+		<maxVersion>*</maxVersion>
+	</targetApplication>
+</extension>

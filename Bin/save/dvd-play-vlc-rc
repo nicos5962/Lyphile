@@ -1,0 +1,269 @@
+#!/bin/bash
+# dvd-play-vlc
+# Version
+VERSION="1.0.0"
+
+# ------------------------------
+# Default values
+# ------------------------------
+START_POS=0
+END_POS=0
+PLAYER_MAC=""
+AUDIO_FORMAT="flac"   # used as VLC acodec
+AUDIO_STREAM=""       # optional override
+DVD_PATH=""
+LOG_DIR="/config/prefs/PlayDVD/log"
+ES=""
+DVD_TITLE=1
+DVD_CHAPTER=1
+ARGS="$@"
+# ------------------------------
+# Functions
+# ------------------------------
+
+function clean_exit() {
+	[[ -f "${LOG_FILE}" ]] && rm -f "${LOG_FILE}"
+	[[ -S "/config/prefs/PlayDVD/vlc-${PLAYER_MAC}.sock" ]] && rm -f "/config/prefs/PlayDVD/vlc-${PLAYER_MAC}.sock"
+	[[ -f "/config/prefs/PlayDVD/log/vlc-report-$PLAYER_MAC.log" ]] && rm -f "/config/prefs/PlayDVD/log/vlc-report-$PLAYER_MAC.log"	
+	exit
+}
+
+log() {
+    local message="$1"
+    local timestamp
+    echo "$message" | tee -a "$LOG_FILE"
+}
+
+show_help() {
+    cat << EOF
+dvd-play-vlc-rc version $VERSION
+
+Usage: $0 [OPTIONS] DVD_PATH
+
+Options:
+  -s START       Start position in seconds (default: 0)
+  -d END         End position in seconds (default: 0)
+  -m MAC         MAC address of the player (required)
+  -f FORMAT      Audio output format (default: flac)
+  -a STREAM      Audio stream ID to select (optional)
+  --help         Show help
+  --version      Show version
+
+DVD_PATH:
+  Full path to DVD ISO or VIDEO_TS directory.
+  Optional suffix ++TITLE:CHAPTER to specify title/chapter.
+
+Example:
+  $0 -s 0 -d 600 -m 12:34:56:78:9A:BC -f flac "/path/to/My DVD.iso++1:1"
+EOF
+}
+
+show_version() {
+    echo "dvd-play-vlc-rc version $VERSION"
+}
+
+# URL-encode function (slashes preserved, % not double-encoded)
+url_encode() {
+    local string="$1"
+    local strlen=${#string}
+    local encoded=""
+    for (( i=0; i<strlen; i++ )); do
+        local c="${string:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) encoded+="$c" ;;
+            /) encoded+="/" ;;
+            %*) encoded+="$c" ;;  # leave existing %XX sequences
+            *) printf -v hex '%%%02X' "'$c"
+               encoded+="$hex" ;;
+        esac
+    done
+    echo "$encoded"
+}
+
+# ------------------------------
+# Detect audio streams using VLC logs
+# ------------------------------
+stream_info() {
+    local input="$1"
+
+    # Temp files
+    local tmp_log tmp_dst
+    tmp_log=$(mktemp --tmpdir=/config/prefs/PlayDVD/log --suffix=".tmp" vlc_streams-XXXX)
+    tmp_dst=$(mktemp --tmpdir=/config/prefs/PlayDVD/log --suffix=".ts"  vlc_streams-XXXX)
+
+    # Nudge VLC to probe streams briefly and log details
+    local pipeline
+    pipeline="cvlc -I dummy --quiet --no-lua \
+    	 --log-verbose=3 --file-logging --logfile=$tmp_log \
+    	 dvdnav://$input \
+         --start-time=1 --stop-time=5 \
+         --no-sout-video \
+         --sout '#duplicate{dst={standard{mux=ts,dst=$tmp_dst,access=file}}}' \
+        vlc://quit"
+    eval "$pipeline"
+
+# Get all matching line numbers
+    line_numbers=$(grep -n -E 'duplicated a new stream codec=[a-z0-9]+[^)]*\(es=[0-9]+' "$tmp_log" | cut -d: -f1)
+    for ln in $line_numbers; do
+    # Read the matching line
+       samplerate=""
+       codec_line=$(sed -n "${ln}p" "$tmp_log")
+       samplerate_line=$(sed -n "$((ln-2))p" "$tmp_log")
+       stream_line="$codec_line $samplerate_line"
+       stream_line=$(echo $stream_line | sed 's/duplicate debug: duplicated a new stream codec=.*es=/es=/')
+       stream_line=$(echo $stream_line | sed 's/group=0).*debug: //')   
+       samplerate=$(echo "$stream_line" | sed -nE 's/.*samplerate:([0-9]+).*/\1/p')
+       bitrate=$(echo "$stream_line"   | sed -nE 's/.*bitrate:([0-9]+).*/\1/p')
+       # Convert bitrate from bps to kb/s
+       bitrate_kbps=$((bitrate / 1000))
+       
+       [ -z "$samplerate" ] && samplerate="samplerate: unknown"
+       [ -z "$bitrate" ]    && bitrate="bitrate: unknown"
+       stream_line=$(echo "$stream_line" | sed -E "s/samplerate:[0-9]+/samplerate:${samplerate}Hz/" \
+                                      | sed -E "s/bitrate:[0-9]+/bitrate:${bitrate_kbps}kb\/s/")
+       log "$stream_line"  
+ 
+       es_raw=$(echo "$stream_line" | grep -oP "es=\K\d+")
+       [ -z "$es_raw" ] && continue
+       [ !-z $ES ] && ES=$es_raw
+  
+       if [[ $stream_line =~ channels:2 ]]; then
+          ES=$es_raw
+       fi
+    done
+    
+    if [[ -n "$ES" ]]; then
+        ES="es=$ES"
+    fi
+        
+    # Cleanup
+    rm -f "$tmp_log" "$tmp_dst"
+}
+
+# ------------------------------
+# Handle --help and --version
+# ------------------------------
+for arg in "$@"; do
+    case "$arg" in
+        --help) show_help; exit 0 ;;
+        --version) show_version; exit 0 ;;
+    esac
+done
+
+# ------------------------------
+# Parse options
+# ------------------------------
+while getopts "s:d:m:f:a:" opt; do
+    case "$opt" in
+        s) START_POS="$OPTARG" ;;
+        d) END_POS="$OPTARG" ;;
+        m) PLAYER_MAC="$OPTARG" ;;
+        f) AUDIO_FORMAT="$OPTARG" ;;
+        a) AUDIO_STREAM="$OPTARG" ;;
+        *) show_help; exit 1 ;;
+    esac
+done
+shift $((OPTIND-1))
+
+# Check DVD path
+if [ $# -lt 1 ]; then
+    echo "Error: DVD path is required"
+    show_help
+    exit 1
+fi
+DVD_PATH="$1"
+
+# ------------------------------
+# Prepare log file
+# ------------------------------
+mkdir -p "$LOG_DIR"
+LOGMAIN="${LOG_DIR}/transcode.log"
+touch "${LOGMAIN}"
+LOG_FILE="$LOG_DIR/${PLAYER_MAC}_transcode.log"
+log "================== NEW RUN =================="
+log "[${0##*/}] $ARGS"
+log "Clock: $(date '+%Y-%m-%d %H:%M:%S')"
+
+# ------------------------------
+# Strip 'dvd://' prefix if present
+# ------------------------------
+DVD_PATH="${DVD_PATH#dvd://}"
+
+# ------------------------------
+# Parse ++TITLE:CHAPTER suffix
+# ------------------------------
+if [[ "$DVD_PATH" =~ \+\+([0-9]+):([0-9]+)$ ]]; then
+    DVD_TITLE="${BASH_REMATCH[1]}"
+    DVD_CHAPTER="${BASH_REMATCH[2]}"
+    DVD_PATH="${DVD_PATH%%++*}"
+fi
+
+# ------------------------------
+# Strip VOB filename if present
+# ------------------------------
+# If the path ends with a .VOB file, remove the filename
+if [[ "$DVD_PATH" =~ /VIDEO_TS/[^/]+\.VOB$ ]]; then
+    DVD_PATH="${DVD_PATH%/*}"  # remove the filename
+fi
+
+# ------------------------------
+# URL encode path
+# ------------------------------
+DVD_PATH_ENCODED=$(url_encode "$DVD_PATH")
+
+# ------------------------------
+# Determine audio stream
+# ------------------------------
+#if [ -n "$AUDIO_STREAM" ]; then
+#    ES="$AUDIO_STREAM"
+#    log "Playing DVD title: $DVD_TITLE, chapter: $DVD_CHAPTER using user-specified audio stream: $ES"
+#else
+#    stream_info "$DVD_PATH_ENCODED#$DVD_TITLE:$DVD_CHAPTER-$DVD_TITLE:$DVD_CHAPTER"
+#    log "Playing DVD title: $DVD_TITLE, chapter: $DVD_CHAPTER with auto-selected audio stream : $ES"
+#fi
+
+# ------------------------------
+# VLC start/stop options
+# ------------------------------
+VLC_TIME_OPTS=""
+[ "$START_POS" -ne 0 ] && VLC_TIME_OPTS+=" --start-time=$START_POS"
+[ "$END_POS" -ne 0 ] && VLC_TIME_OPTS+=" --stop-time=$END_POS"
+
+# ------------------------------
+# Log script info
+# ------------------------------
+log "Audio converted to format: $AUDIO_FORMAT"
+log "=================================="
+
+# ------------------------------
+# Build VLC --sout
+# ------------------------------
+#if [[ -n "$ES" ]]; then
+#   VLC_SOUT="#duplicate{dst={transcode{acodec=$AUDIO_FORMAT,channels=2,samplerate=48000}:standard{mux=wav,dst=-,access=file}},select=\"$ES\"}"
+#else
+#   VLC_SOUT="#duplicate{dst={transcode{acodec=$AUDIO_FORMAT,channels=2,samplerate=48000}:standard{mux=wav,dst=-,access=file}}}"
+#fi
+
+if [ ! -p  "/config/prefs/PlayDVD/vlc-${PLAYER_MAC}.sock" ]; then
+    mkfifo "/config/prefs/PlayDVD/vlc-${PLAYER_MAC}.sock"
+fi
+VLC_SOUT="'"$VLC_SOUT"'"
+VLC_CMD="cvlc -I oldrc --rc-fake-tty --rc-unix /config/prefs/PlayDVD/vlc-${PLAYER_MAC}.sock --no-lua \
+--log-verbose=3 --file-logging --logfile=/config/prefs/PlayDVD/log/vlc-report-$PLAYER_MAC.log \
+dvdnav://$DVD_PATH_ENCODED#$DVD_TITLE:$DVD_CHAPTER $VLC_TIME_OPTS --no-sout-video \
+--sout '#transcode{acodec=$AUDIO_FORMAT,channels=2,samplerate=48000}:std{access=file,mux=wav,dst=-}' \
+--rate=1 \
+--clock-synchro=1 \
+vlc://quit"
+
+log "VLC command: $VLC_CMD"
+
+# ------------------------------
+# Execute VLC
+# ------------------------------
+log "Run completed."
+cat "${LOG_FILE}" >> "${LOGMAIN}"
+trap clean_exit EXIT
+eval "$VLC_CMD"
+
+rm -f "${LOG_FILE}" "/config/prefs/PlayDVD/log/vlc-report-$PLAYER_MAC.log"

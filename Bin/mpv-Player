@@ -1,0 +1,392 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# mpv-Player
+# Lyrion plugin helper: mpv plays the input and writes raw stereo PCM to a named pipe, ffmpeg reads
+# the pipe and writes the audio to stdout, in the format of the -f option (flac, pcm, wav, mp3; flac
+# when it is missing). Nothing else goes to stdout: the logs go to files. Same job and layout as
+# vlc-Player. The PCM (16 or 24 bit, 44100, 48000 or 96000 Hz) is a preference of the player
+# (plugin.lyphile:tc_bits, tc_rate), asked of Lyrion through Bin/jsonrpc. No filters: there is no
+# equalizer for mpv (mpv answers its remote socket too late for a filter to be moved while it plays).
+#
+# Usage:
+#   mpv-Player -m <MAC> -f <format> [-M mode] [-s start] [-d duration] [-B kbps] "<input>"
+#
+# <input>, the LAST argument:
+#   /path/to/file.mkv                           a plain media file
+#   /path/to/disc.iso | .img                    a DVD image, mpv takes its longest title
+#   dvd:///path/to/disc.iso?title=4             a DVD title (ISO, image or VIDEO_TS folder)
+#   dvd:///path/to/disc.iso?title=4&chapter=2   ... from a chapter (numbers from 1)
+#   dvd:///path/to/VIDEO_TS/VTS_01_1.VOB?title=4   a VOB of a VIDEO_TS folder: the folder is used
+#   dvd:///path/to/file.mkv?title=1             a plain media file ("title" is a placeholder)
+# A DVD is played by mpv as  dvd://<title> --dvd-device=<path> [--start=#<chapter>]
+#
+# Options of the convert rule (custom-convert.conf):
+#   -m <mac>        player id          -f <format>   flc | pcm | wav | mp3
+#   -M <mode>       (unused)           -s <seconds>  start time
+#   -d <seconds>    duration           -B <kbps>     mp3 bitrate
+# -M, -s and -d are parsed only: nothing uses them yet.
+#
+# ffmpeg reads the pipe at 1x (-readrate 1): the full pipe holds mpv back, so mpv plays at normal
+# speed. The pipe is <player folder>/<mac>.fifo. mpv's JSON IPC listens on the unix socket of the
+# player, the "IPC server" value of the Lyphile settings page, which this script asks of Lyrion
+# with Bin/jsonrpc (default /tmp/lyphile-mpv/<mac>.sock when there is no answer).
+# The player folder is /config/logs/lyphile/remote_players/<mac with dashes>/, where the logs are
+# too. mpv ends itself when the input is finished; the script also kills mpv and ffmpeg on any
+# exit and removes the pipe and the socket.
+#
+# Logs of a player, in /config/logs/lyphile/remote_players/<mac>/ (<mac> with dashes):
+#   mpv-<mac>.log             what mpv prints         (emptied at every start)
+#   ffmpeg-<mac>.log          what ffmpeg prints      (emptied at every start)
+#   mpv-transcode-<mac>.log   this run, in the layout of PlayDVD's DVD-Transcode: header with the
+#                             arguments, clock, source, [title, chapter,] output format, errors,
+#                             exit status (emptied at every start)
+#   transcode.log             every run, shared with vlc-Player: mpv-transcode-<mac>.log is
+#                             appended to it when the run ends
+# When the run ends the pipe, the socket and the three per-run logs above are removed (KEEP_LOGS=1
+# below keeps the logs); transcode.log stays.
+# LOGDETAIL=1 (below) adds the exit codes of mpv and ffmpeg to mpv-transcode-<mac>.log.
+# ==============================================================================
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+VERSION="1.0.0"
+DIR="${LYPHILE_BASEDIR:-/config/prefs/Lyphile}"        # only if the player folder cannot be created
+LOGBASE="${LYPHILE_LOGBASE:-/config/logs/lyphile/remote_players}"
+MPV_IPC_DIR="${LYPHILE_MPV_IPC_DIR:-/tmp/lyphile-mpv}"  # socket folder when the settings give none
+JSONRPC="${LYPHILE_JSONRPC:-$(dirname "$(readlink -f "$0")")/jsonrpc}"
+
+# ffmpeg log level: quiet error warning info verbose debug (what goes to ffmpeg-<mac>.log)
+FFLEVEL=verbose
+
+# 1 = more detail in mpv-transcode-<mac>.log (see the header)
+LOGDETAIL=1
+
+# 0 = when the run ends, the per-run logs (mpv-transcode-<mac>.log, mpv-<mac>.log, ffmpeg-<mac>.log)
+# are removed, only transcode.log stays. 1 = keep them, to read what mpv and ffmpeg printed.
+KEEP_LOGS=0
+
+# ------------------------------------------------------------------------------
+# Logging helpers: the script's log goes to a per-run block, never to stdout
+# ------------------------------------------------------------------------------
+log() {
+    echo "$*" >> "${LOG}"
+}
+
+# a line only written when LOGDETAIL=1
+detail() {
+    if (( LOGDETAIL )); then log "$*"; fi
+}
+
+# Fatal error: the message goes to stderr, which is captured in LOGTMP and merged into the log
+# by clean_exit.
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+# Cleanup: runs on every exit path once the trap is installed
+# ------------------------------------------------------------------------------
+MPV_PID="" FF_PID="" INTERRUPTED=0 FF_STOPPED=0
+FIFO="" SOCK="" LOG="" LOGTMP="" LOGMAIN="" MPVLOG="" FFLOG=""
+
+kill_children() {
+    if [[ -n "${MPV_PID}" ]]; then kill -KILL "${MPV_PID}" 2>/dev/null || true; fi
+    if [[ -n "${FF_PID}"  ]]; then kill -KILL "${FF_PID}"  2>/dev/null || true; fi
+}
+
+clean_exit() {
+    local rc=$?
+    trap - EXIT
+    kill_children
+
+    if (( INTERRUPTED )); then
+        log "  Stream interrupted by client"
+        rc=0        # skip/stop is normal: report success
+    elif (( rc != 0 )) && [[ -s "${FFLOG}" ]] && grep -qE 'Broken pipe|received signal' "${FFLOG}"; then
+        log "  Stream interrupted by client"
+        rc=0
+    fi
+
+    sed -e '/Broken pipe/d' -e '/: line [0-9]*: *[0-9]* Killed/d' -e 's/^/  /' "${LOGTMP}" >> "${LOG}" || true
+    log "  Exit status: ${rc}"
+    cat "${LOG}" >> "${LOGMAIN}"
+    rm -f "${LOGTMP}" "${FIFO}" "${SOCK}"
+    if (( ! KEEP_LOGS )); then rm -f "${LOG}" "${MPVLOG}" "${FFLOG}"; fi
+    # the list of usable audio tracks, unless a later run has already written its own (its pid is in the pid file)
+    if [[ "$(cat "${PIDFILE}" 2>/dev/null || true)" == "$$" ]]; then rm -f "${STREAMS}" "${PIDFILE}"; fi
+    exit "${rc}"
+}
+
+# A signal (Lyrion stopping the stream) ends mpv and ffmpeg; clean_exit reports it
+on_signal() {
+    INTERRUPTED=1
+    kill_children
+}
+
+# ------------------------------------------------------------------------------
+# Parse arguments
+# ------------------------------------------------------------------------------
+ARGS="$*"
+PLAYER_MAC="" FORMAT="" MODE="" START="" DURATION="" BITRATE="" BAD=""
+
+while getopts ':m:f:M:s:d:B:' opt; do
+    case "${opt}" in
+        m) PLAYER_MAC="${OPTARG}" ;;
+        f) FORMAT="${OPTARG}" ;;
+        M) MODE="${OPTARG}" ;;
+        s) START="${OPTARG}" ;;
+        d) DURATION="${OPTARG}" ;;
+        B) BITRATE="${OPTARG}" ;;
+        :) BAD+=" missing value for -${OPTARG};" ;;
+        *) BAD+=" unknown option -${OPTARG};" ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+
+INPUT=""
+for a in "$@"; do INPUT="${a}"; done
+
+if [[ -z "${PLAYER_MAC}" ]]; then
+    PLAYER_MAC="unknown"
+elif [[ ! "${PLAYER_MAC}" =~ ^[0-9A-Fa-f:-]+$ ]]; then
+    BAD+=" invalid player mac;"
+    PLAYER_MAC="unknown"
+fi
+FILE_ID="${PLAYER_MAC//:/-}"       # dash form: safe in file names
+
+# ------------------------------------------------------------------------------
+# Set up the logs, then install the traps and capture stderr
+# ------------------------------------------------------------------------------
+LOGDIR="${LOGBASE}/${FILE_ID}"
+# the player folder: logs, pipe and output. If it cannot be created, DIR is used instead
+if ! mkdir -p "${LOGDIR}" 2>/dev/null; then
+    LOGDIR="${DIR}"
+    mkdir -p "${LOGDIR}"
+fi
+LOG="${LOGDIR}/mpv-transcode-${FILE_ID}.log"
+LOGMAIN="${LOGDIR}/transcode.log"
+MPVLOG="${LOGDIR}/mpv-${FILE_ID}.log"
+FFLOG="${LOGDIR}/ffmpeg-${FILE_ID}.log"
+touch "${LOGMAIN}"
+: > "${LOG}"
+LOGTMP=$(mktemp --tmpdir="${LOGDIR}" --suffix=".tmp" stderr-XXXXXX)
+: > "${MPVLOG}"
+: > "${FFLOG}"
+
+FIFO="${LOGDIR}/${FILE_ID}.fifo"
+STREAMS="${LOGDIR}/audio-streams.txt"      # the audio tracks the player page lists (aid numbers)
+PIDFILE="${LOGDIR}/mpv-player.pid"
+
+# the IPC socket: the "IPC server" of the player's settings, asked of Lyrion through Bin/jsonrpc
+# (which reads the server address that the plugin wrote into <prefs>/Lyphile/jsonrpc)
+SOCK=""
+if [[ -x "${JSONRPC}" && "${PLAYER_MAC}" != "unknown" ]]; then
+    SOCK=$("${JSONRPC}" "${FILE_ID//-/:}" playerpref plugin.lyphile:mpv_ipc_server '?' \
+           | jq -r '.result._p2 // empty' 2>/dev/null) || true
+fi
+if [[ ! "${SOCK}" =~ ^/[A-Za-z0-9_./-]+$ || "${SOCK}" == *..* ]]; then SOCK="${MPV_IPC_DIR}/${FILE_ID}.sock"; fi
+
+exec 2>> "${LOGTMP}"     # from here on, every error message ends up in the log
+trap clean_exit EXIT     # from here on, every exit path is cleaned up
+trap on_signal TERM INT HUP
+
+log "[${SCRIPT_NAME} v${VERSION}] ${ARGS}"
+log "  Clock: $(date +%H:%M:%S.%3N)"
+if [[ -n "${BAD}" ]]; then log "  Option problems:${BAD}"; fi
+
+# ------------------------------------------------------------------------------
+# The input: a DVD URI, a DVD image, or a plain media file
+# ------------------------------------------------------------------------------
+[[ -n "${INPUT}" ]] || die "No input given."
+
+DVD_PATH="" DVD_TITLE="" DVD_CHAPTER="" IS_DVD=0
+
+if [[ "${INPUT}" == dvd://* ]]; then
+    # dvd:///path/to/file.iso?title=4[&chapter=2]
+    uri_no_scheme="${INPUT#dvd://}"
+    uri_path="${uri_no_scheme%%\?*}"
+    uri_query=""
+    if [[ "${uri_no_scheme}" == *\?* ]]; then uri_query="${uri_no_scheme#*\?}"; fi
+
+    # URL-decode the path (convert %XX sequences to characters).
+    # Literal backslashes are protected first so printf %b does not interpret them.
+    uri_path="${uri_path//\\/%5C}"
+    DVD_PATH="$(printf '%b' "${uri_path//%/\\x}")"
+
+    # ?title= (mandatory, numeric)
+    if [[ "${uri_query}" =~ (^|[\&])title=([^\&]+) ]]; then
+        DVD_TITLE="${BASH_REMATCH[2]}"
+    else
+        die "DVD URI must contain '?title=<N>' (query: ${uri_query})"
+    fi
+    [[ "${DVD_TITLE}" =~ ^[0-9]+$ ]] || die "Invalid title: ${DVD_TITLE}"
+
+    # ?chapter= (optional, numeric)
+    if [[ "${uri_query}" =~ (^|[\&])chapter=([^\&]+) ]]; then
+        DVD_CHAPTER="${BASH_REMATCH[2]}"
+        [[ "${DVD_CHAPTER}" =~ ^[0-9]+$ ]] || die "Invalid chapter: ${DVD_CHAPTER}"
+    fi
+
+    # If the path ends with a .VOB file, remove the filename
+    if [[ "${DVD_PATH}" =~ /VIDEO_TS/[^/]+\.[Vv][Oo][Bb]$ ]]; then
+        DVD_PATH="${DVD_PATH%/*}"
+    fi
+    IS_DVD=1
+else
+    DVD_PATH="${INPUT}"
+    # a DVD image given as a plain path: no title is known, mpv takes the longest one
+    if [[ -f "${DVD_PATH}" && "${DVD_PATH,,}" =~ \.(iso|img)$ ]]; then
+        IS_DVD=1
+    fi
+fi
+
+# A plain video file (not a disc image or VIDEO_TS folder) is read as it is: the "title" of its
+# URL is only a placeholder
+VIDEO_FILE=0
+if (( IS_DVD )) && [[ -f "${DVD_PATH}" ]] \
+   && [[ "${DVD_PATH,,}" =~ \.(mkv|mka|mk3d|webm|mp4|m4v|ts|m2ts|mts|avi|mpg|mpeg)$ ]]; then
+    VIDEO_FILE=1
+    IS_DVD=0
+fi
+
+[[ -e "${DVD_PATH}" ]] || die "Source not found: ${DVD_PATH}"
+
+# PCM between mpv and ffmpeg: preferences of the player (Control tab of the mpv page), asked of
+# Lyrion through Bin/jsonrpc. Always stereo (a downmix). Anything else, or no answer, gives 16 bit and 48000 Hz.
+pref() {
+    "${JSONRPC}" "${FILE_ID//-/:}" playerpref "plugin.lyphile:$1" '?' | jq -r '.result._p2 // empty' 2>/dev/null || true
+}
+TC_BITS=16 TC_RATE=48000
+if [[ -x "${JSONRPC}" && "${PLAYER_MAC}" != "unknown" ]]; then
+    v=$(pref tc_bits);    [[ "${v}" == 16 || "${v}" == 24 ]] && TC_BITS="${v}"
+    v=$(pref tc_rate);    [[ "${v}" == 44100 || "${v}" == 48000 || "${v}" == 96000 ]] && TC_RATE="${v}"
+fi
+# mpv has no 24 bit format: 24 bit goes as 32 bit, which ffmpeg writes as 24 bit
+PCM_FMT="s16"; if (( TC_BITS == 24 )); then PCM_FMT="s32"; fi
+
+# Output format: ffmpeg options
+OUTFORMAT="${FORMAT:-flac}"
+case "${OUTFORMAT}" in
+    flac|flc) EXT=flac; FMT_OPTS=( -c:a flac -f flac ) ;;
+    pcm)      EXT=pcm;  FMT_OPTS=( -c:a "pcm_s${TC_BITS}le" -f "s${TC_BITS}le" ) ;;
+    wav)      EXT=wav;  FMT_OPTS=( -c:a "pcm_s${TC_BITS}le" -f wav ) ;;
+    mp3)      EXT=mp3;  FMT_OPTS=( -c:a libmp3lame -b:a "${BITRATE:-192}k" -f mp3 ) ;;
+    *)        die "Unknown format '${OUTFORMAT}' (-f): use flac, pcm, wav or mp3" ;;
+esac
+
+log "  Source: ${DVD_PATH/*music/Music Folder}"
+if (( VIDEO_FILE )); then log "  Video file (no disc title)"; fi
+if (( IS_DVD )); then
+    if [[ -n "${DVD_TITLE}" ]]; then log "  Title: ${DVD_TITLE}"; else log "  Title: (mpv default)"; fi
+    if [[ -n "${DVD_CHAPTER}" ]]; then log "  Chapter: ${DVD_CHAPTER}"; fi
+fi
+log "  Output format: ${OUTFORMAT^^}, PCM ${TC_BITS} bit ${TC_RATE} Hz stereo"
+
+# ------------------------------------------------------------------------------
+# Pre-flight checks
+# ------------------------------------------------------------------------------
+command -v ffmpeg &>/dev/null || die "ffmpeg not found in PATH."
+command -v mpv    &>/dev/null || die "mpv not found in PATH."
+
+# The audio tracks that have data at the start. A disc can have a track with none (this DVD's third track starts much
+# later): selecting it would leave mpv with nothing to play, and the audio stops. ffprobe says which tracks have packets in
+# the first 3 s; mpv numbers the audio tracks from 1 in the same order (aid = position + 1). The player page lists only
+# those (the file audio-streams.txt, removed with the run).
+echo "$$" > "${PIDFILE}"
+rm -f "${STREAMS}"
+if command -v ffprobe &>/dev/null; then
+    PROBE_OPTS=()
+    if (( IS_DVD )); then
+        PROBE_OPTS=( -f dvdvideo )
+        if [[ -n "${DVD_TITLE}" ]]; then PROBE_OPTS+=( -title "${DVD_TITLE}" ); fi
+    fi
+    mapfile -t ALL_AUDIO < <(ffprobe -v error "${PROBE_OPTS[@]}" -select_streams a -show_entries stream=index -of csv=p=0 \
+                              -i "${DVD_PATH}" 2>/dev/null < /dev/null | sort -n || true)
+    mapfile -t HAVE_DATA < <(ffprobe -v error "${PROBE_OPTS[@]}" -select_streams a -read_intervals "${START:-0}%+3" \
+                             -show_entries packet=stream_index -of csv=p=0 -i "${DVD_PATH}" 2>/dev/null < /dev/null | sort -un || true)
+    LIVE_AIDS=()
+    for i in "${!ALL_AUDIO[@]}"; do
+        for have in "${HAVE_DATA[@]}"; do
+            if [[ "${have}" == "${ALL_AUDIO[i]}" ]]; then LIVE_AIDS+=( $(( i + 1 )) ); break; fi
+        done
+    done
+    if (( ${#LIVE_AIDS[@]} > 0 && ${#LIVE_AIDS[@]} < ${#ALL_AUDIO[@]} )); then
+        echo "${LIVE_AIDS[*]}" > "${STREAMS}"
+        log "  Audio tracks: ${#ALL_AUDIO[@]}, with data at the start: ${LIVE_AIDS[*]} (the others are not listed)"
+    fi
+fi
+
+mkdir -p "$(dirname "${SOCK}")" || die "Cannot create the socket folder of ${SOCK}"
+rm -f "${FIFO}" "${SOCK}"
+mkfifo "${FIFO}" || die "Cannot create the pipe ${FIFO}"
+
+# ------------------------------------------------------------------------------
+# Build and run the commands: ffmpeg first (it waits on the pipe until mpv opens it, and ends
+# when mpv closes it), then mpv. mpv: no config, no terminal (its log goes to --log-file), no
+# video or subtitles, raw s16 48 kHz stereo to the pipe through the pcm audio output.
+# ------------------------------------------------------------------------------
+FFMPEG_CMD=( ffmpeg -nostdin -hide_banner -v "${FFLEVEL}" -nostats -y -readrate 1
+             -f "${PCM_FMT}le" -ar "${TC_RATE}" -ac 2 -i "${FIFO}" -vn "${FMT_OPTS[@]}" pipe:1 )
+
+# mpv: no config, no terminal (its log goes to --log-file), no video or subtitles, stereo PCM to the pipe through the pcm
+# audio output (the pipe is read at real time, which is what paces mpv)
+MPV_CMD=( mpv --no-config --terminal=no "--log-file=${MPVLOG}" --load-scripts=no --ytdl=no
+          --vid=no --audio-display=no --sid=no
+          --ao=pcm --ao-pcm-waveheader=no --ao-pcm-append=yes "--ao-pcm-file=${FIFO}"
+          "--audio-format=${PCM_FMT}" "--audio-samplerate=${TC_RATE}" --audio-channels=stereo
+          "--input-ipc-server=${SOCK}" )
+# a start time (Lyrion seeks a file by starting the transcoder at that time) and a duration
+if [[ "${START}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then MPV_CMD+=( "--start=${START}" ); fi
+if [[ "${DURATION}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then MPV_CMD+=( "--length=${DURATION}" ); fi
+if (( IS_DVD )); then
+    MPV_CMD+=( "--dvd-device=${DVD_PATH}" )
+    if [[ -n "${DVD_CHAPTER}" && -z "${START}" ]]; then MPV_CMD+=( "--start=#${DVD_CHAPTER}" ); fi
+    # mpv counts the titles of a disc from 0: dvd://0 is the first title of libdvdnav and of ffmpeg's dvdvideo, which is the
+    # numbering of the URLs of the plugin (checked on two discs: ffmpeg title 1 is dvd://0, ffmpeg title 2 is dvd://1)
+    MPV_TITLE=$(( DVD_TITLE > 0 ? DVD_TITLE - 1 : 0 ))
+    detail "  mpv title: ${MPV_TITLE}"
+    MPV_CMD+=( -- "dvd://${MPV_TITLE}" )
+else
+    MPV_CMD+=( -- "${DVD_PATH}" )
+fi
+
+"${FFMPEG_CMD[@]}" 2>> "${FFLOG}" &    # stdout stays the script's stdout: the audio
+FF_PID=$!
+"${MPV_CMD[@]}" >> "${MPVLOG}" 2>&1 &
+MPV_PID=$!
+
+# ffmpeg ends at the end of the audio. If mpv ends first without ever opening the pipe (a bad
+# input), ffmpeg would wait for ever: it gets 5 s, then it is stopped.
+gone=0
+while kill -0 "${FF_PID}" 2>/dev/null; do
+    if ! kill -0 "${MPV_PID}" 2>/dev/null; then
+        (( ++gone ))
+        if (( gone > 25 )); then
+            log "  mpv ended and ffmpeg got no more audio for 5 s: ffmpeg stopped"
+            kill -KILL "${FF_PID}" 2>/dev/null || true
+            FF_STOPPED=1
+        fi
+    fi
+    sleep 0.2
+done
+
+rc=0
+wait "${FF_PID}" || rc=$?
+
+# mpv must not stay behind
+mpv_note=""
+if kill -0 "${MPV_PID}" 2>/dev/null; then
+    mpv_note=" (killed)"
+    kill -KILL "${MPV_PID}" 2>/dev/null || true
+fi
+mrc=0
+wait "${MPV_PID}" || mrc=$?
+detail "  ffmpeg exit: ${rc}, mpv exit: ${mrc}${mpv_note}"
+
+# an mpv that failed (and so produced no audio) is a failure even if ffmpeg ended cleanly
+if (( rc == 0 && mrc != 0 )) && [[ -z "${mpv_note}" ]]; then rc=1; fi
+if (( FF_STOPPED )); then rc=1; fi
+
+exit "${rc}"     # → clean_exit logs the status, merges the logs, removes the temp files

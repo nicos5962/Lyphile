@@ -1,0 +1,22 @@
+# String file for Lyphile skin plugin
+
+PLUGIN_LYPHILE
+	EN	Lyphile
+
+PLUGIN_LYPHILE_DESC
+	EN	Lyphile skin, based on the Default skin.
+
+PLUGIN_LYPHILE_VLC
+	EN	VLC
+
+PLUGIN_LYPHILE_VLC_LUA
+	EN	VLC Lua
+
+PLUGIN_LYPHILE_MPV
+	EN	mpv
+
+PLUGIN_LYPHILE_FFMPEG
+	EN	ffmpeg
+
+SKIN_LYPHILE
+	EN	Lyphile

@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# vlc-Player
+# Lyrion plugin helper: VLC plays the input and writes raw PCM (s16le, 48 kHz, stereo) to a
+# named pipe, ffmpeg reads the pipe and writes
+#   /config/logs/lyphile/remote_players/<mac>/test.<ext>
+# in the format of the -f option (flac, pcm, wav, mp3; flac when it is missing). Nothing goes to
+# stdout (first iterations: the output is a file).
+#
+# Usage:
+#   vlc-Player -m <MAC> -f <format> [-M mode] [-s start] [-d duration] [-B kbps] "<input>"
+#
+# <input>, the LAST argument:
+#   /path/to/file.mkv                           a plain media file
+#   /path/to/disc.iso | .img                    a DVD image, VLC's default title (no menu)
+#   dvd:///path/to/disc.iso?title=4             a DVD title (ISO, image or VIDEO_TS folder)
+#   dvd:///path/to/disc.iso?title=4&chapter=2   ... from a chapter
+#   dvd:///path/to/VIDEO_TS/VTS_01_1.VOB?title=4   a VOB of a VIDEO_TS folder: the folder is used
+#   dvd:///path/to/file.mkv?title=1             a plain media file ("title" is a placeholder)
+# A DVD is played by VLC as  dvdnav://<url-encoded path>#<title>[:<chapter>]
+#
+# Options of the convert rule (custom-convert.conf):
+#   -m <mac>        player id          -f <format>   flc | pcm | wav | mp3
+#   -M <mode>       sout | aout        -s <seconds>  start time
+#   -d <seconds>    duration           -B <kbps>     mp3 bitrate
+# -M, -s and -d are parsed only: nothing uses them yet.
+#
+# ffmpeg reads the pipe at 1x (-readrate 1): the full pipe holds VLC back, so VLC plays at normal
+# speed. The pipe is <player folder>/<mac>.fifo, and VLC's remote control (oldrc interface) listens on
+# the unix socket <player folder>/<mac>.sock. The player folder is
+# /config/logs/lyphile/remote_players/<mac with dashes>/, where the logs are too.
+# VLC ends itself when the input is finished (--play-and-exit); the script also kills VLC and
+# ffmpeg on any exit and removes the pipe and the socket.
+#
+# Logs of a player, in /config/logs/lyphile/remote_players/<mac>/ (<mac> with dashes):
+#   vlc-<mac>.log             what VLC prints         (emptied at every start)
+#   ffmpeg-<mac>.log          what ffmpeg prints      (emptied at every start)
+#   vlc-transcode-<mac>.log   this run, in the layout of PlayDVD's DVD-Transcode: header with the
+#                             arguments, clock, source, [title, chapter,] output format, errors,
+#                             exit status (emptied at every start)
+#   transcode.log             every run: vlc-transcode-<mac>.log is appended to it when the run
+#                             ends
+# LOGDETAIL=1 (below) adds options, output, pipe, socket, log folder, both commands and the exit
+# codes of VLC and ffmpeg to vlc-transcode-<mac>.log.
+# ==============================================================================
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+VERSION="1.0.0"
+DIR="${LYPHILE_BASEDIR:-/config/prefs/Lyphile}"        # only if the player folder cannot be created
+LOGBASE="${LYPHILE_LOGBASE:-/config/logs/lyphile/remote_players}"
+
+# ffmpeg log level: quiet error warning info verbose debug (what goes to ffmpeg-<mac>.log)
+FFLEVEL=verbose
+
+# 1 = more detail in vlc-transcode-<mac>.log (see the header)
+LOGDETAIL=0
+
+# ------------------------------------------------------------------------------
+# Logging helpers: the script's log goes to a per-run block, never to stdout
+# ------------------------------------------------------------------------------
+log() {
+    echo "$*" >> "${LOG}"
+}
+
+# a line only written when LOGDETAIL=1
+detail() {
+    if (( LOGDETAIL )); then log "$*"; fi
+}
+
+# Fatal error: the message goes to stderr, which is captured in LOGTMP and merged into the log
+# by clean_exit.
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+# Percent-encode a path the way the old DVD script did: letters, digits and . ~ _ - / stay
+url_encode() {
+    local LC_ALL=C
+    local s="$1" out="" c h i
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "${c}" in
+            [a-zA-Z0-9.~_/-]) out+="${c}" ;;
+            *) printf -v h '%%%02X' "'${c}"; out+="${h}" ;;
+        esac
+    done
+    printf '%s' "${out}"
+}
+
+# ------------------------------------------------------------------------------
+# Cleanup: runs on every exit path once the trap is installed
+# ------------------------------------------------------------------------------
+VLC_PID="" FF_PID="" INTERRUPTED=0 FF_STOPPED=0
+FIFO="" SOCK="" LOG="" LOGTMP="" LOGMAIN="" FFLOG=""
+
+kill_children() {
+    if [[ -n "${VLC_PID}" ]]; then kill -KILL "${VLC_PID}" 2>/dev/null || true; fi
+    if [[ -n "${FF_PID}"  ]]; then kill -KILL "${FF_PID}"  2>/dev/null || true; fi
+}
+
+clean_exit() {
+    local rc=$?
+    trap - EXIT
+    kill_children
+
+    if (( INTERRUPTED )); then
+        log "  Stream interrupted by client"
+        rc=0        # skip/stop is normal: report success
+    elif (( rc != 0 )) && [[ -s "${FFLOG}" ]] && grep -qE 'Broken pipe|received signal' "${FFLOG}"; then
+        log "  Stream interrupted by client"
+        rc=0
+    fi
+
+    sed -e '/Broken pipe/d' -e '/: line [0-9]*: *[0-9]* Killed/d' -e 's/^/  /' "${LOGTMP}" >> "${LOG}" || true
+    log "  Exit status: ${rc}"
+    cat "${LOG}" >> "${LOGMAIN}"
+    rm -f "${LOGTMP}" "${FIFO}" "${SOCK}"
+    exit "${rc}"
+}
+
+# A signal (Lyrion stopping the stream) ends VLC and ffmpeg; clean_exit reports it
+on_signal() {
+    INTERRUPTED=1
+    kill_children
+}
+
+# ------------------------------------------------------------------------------
+# Parse arguments
+# ------------------------------------------------------------------------------
+ARGS="$*"
+PLAYER_MAC="" FORMAT="" MODE="" START="" DURATION="" BITRATE="" BAD=""
+
+while getopts ':m:f:M:s:d:B:' opt; do
+    case "${opt}" in
+        m) PLAYER_MAC="${OPTARG}" ;;
+        f) FORMAT="${OPTARG}" ;;
+        M) MODE="${OPTARG}" ;;
+        s) START="${OPTARG}" ;;
+        d) DURATION="${OPTARG}" ;;
+        B) BITRATE="${OPTARG}" ;;
+        :) BAD+=" missing value for -${OPTARG};" ;;
+        *) BAD+=" unknown option -${OPTARG};" ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+
+INPUT=""
+for a in "$@"; do INPUT="${a}"; done
+
+if [[ -z "${PLAYER_MAC}" ]]; then
+    PLAYER_MAC="unknown"
+elif [[ ! "${PLAYER_MAC}" =~ ^[0-9A-Fa-f:-]+$ ]]; then
+    BAD+=" invalid player mac;"
+    PLAYER_MAC="unknown"
+fi
+FILE_ID="${PLAYER_MAC//:/-}"       # dash form: safe in file names
+
+# ------------------------------------------------------------------------------
+# Set up the logs, then install the traps and capture stderr
+# ------------------------------------------------------------------------------
+LOGDIR="${LOGBASE}/${FILE_ID}"
+# the player folder: logs, pipe, socket and output. If it cannot be created, DIR is used instead
+if ! mkdir -p "${LOGDIR}" 2>/dev/null; then
+    LOGDIR="${DIR}"
+    mkdir -p "${LOGDIR}"
+fi
+LOG="${LOGDIR}/vlc-transcode-${FILE_ID}.log"
+LOGMAIN="${LOGDIR}/transcode.log"
+VLCLOG="${LOGDIR}/vlc-${FILE_ID}.log"
+FFLOG="${LOGDIR}/ffmpeg-${FILE_ID}.log"
+touch "${LOGMAIN}"
+: > "${LOG}"
+LOGTMP=$(mktemp --tmpdir="${LOGDIR}" --suffix=".tmp" stderr-XXXXXX)
+: > "${VLCLOG}"
+: > "${FFLOG}"
+
+FIFO="${LOGDIR}/${FILE_ID}.fifo"
+SOCK="${LOGDIR}/${FILE_ID}.sock"
+
+exec 2>> "${LOGTMP}"     # from here on, every error message ends up in the log
+trap clean_exit EXIT     # from here on, every exit path is cleaned up
+trap on_signal TERM INT HUP
+
+# VLC wants a writable home for its config
+export HOME=/tmp/vlchome
+mkdir -p "${HOME}"
+
+log "[${SCRIPT_NAME} v${VERSION}] ${ARGS}"
+log "  Clock: $(date +%H:%M:%S.%3N)"
+if [[ -n "${BAD}" ]]; then log "  Option problems:${BAD}"; fi
+
+# ------------------------------------------------------------------------------
+# The input: a DVD URI, a DVD image, or a plain media file
+# ------------------------------------------------------------------------------
+[[ -n "${INPUT}" ]] || die "No input given."
+
+DVD_PATH="" DVD_TITLE="" DVD_CHAPTER="" IS_DVD=0 DVD_MENU_OFF=0
+
+if [[ "${INPUT}" == dvd://* ]]; then
+    # dvd:///path/to/file.iso?title=4[&chapter=2]
+    uri_no_scheme="${INPUT#dvd://}"
+    uri_path="${uri_no_scheme%%\?*}"
+    uri_query=""
+    if [[ "${uri_no_scheme}" == *\?* ]]; then uri_query="${uri_no_scheme#*\?}"; fi
+
+    # URL-decode the path (convert %XX sequences to characters).
+    # Literal backslashes are protected first so printf %b does not interpret them.
+    uri_path="${uri_path//\\/%5C}"
+    DVD_PATH="$(printf '%b' "${uri_path//%/\\x}")"
+
+    # ?title= (mandatory, numeric)
+    if [[ "${uri_query}" =~ (^|[\&])title=([^\&]+) ]]; then
+        DVD_TITLE="${BASH_REMATCH[2]}"
+    else
+        die "DVD URI must contain '?title=<N>' (query: ${uri_query})"
+    fi
+    [[ "${DVD_TITLE}" =~ ^[0-9]+$ ]] || die "Invalid title: ${DVD_TITLE}"
+
+    # ?chapter= (optional, numeric)
+    if [[ "${uri_query}" =~ (^|[\&])chapter=([^\&]+) ]]; then
+        DVD_CHAPTER="${BASH_REMATCH[2]}"
+        [[ "${DVD_CHAPTER}" =~ ^[0-9]+$ ]] || die "Invalid chapter: ${DVD_CHAPTER}"
+    fi
+
+    # If the path ends with a .VOB file, remove the filename
+    if [[ "${DVD_PATH}" =~ /VIDEO_TS/[^/]+\.[Vv][Oo][Bb]$ ]]; then
+        DVD_PATH="${DVD_PATH%/*}"
+    fi
+    IS_DVD=1
+else
+    DVD_PATH="${INPUT}"
+    # a DVD image given as a plain path: no title is known, VLC takes its default (no menu)
+    if [[ -f "${DVD_PATH}" && "${DVD_PATH,,}" =~ \.(iso|img)$ ]]; then
+        IS_DVD=1
+        DVD_MENU_OFF=1
+    fi
+fi
+
+# A plain video file (not a disc image or VIDEO_TS folder) is read as it is: the "title" of its
+# URL is only a placeholder
+VIDEO_FILE=0
+if (( IS_DVD )) && [[ -f "${DVD_PATH}" ]] \
+   && [[ "${DVD_PATH,,}" =~ \.(mkv|mka|mk3d|webm|mp4|m4v|ts|m2ts|mts|avi|mpg|mpeg)$ ]]; then
+    VIDEO_FILE=1
+    IS_DVD=0
+fi
+
+[[ -e "${DVD_PATH}" ]] || die "Source not found: ${DVD_PATH}"
+
+# The MRL VLC gets
+if (( IS_DVD )); then
+    MRL="dvdnav://$(url_encode "${DVD_PATH}")"
+    if [[ -n "${DVD_TITLE}" ]]; then
+        MRL+="#${DVD_TITLE}"
+        if [[ -n "${DVD_CHAPTER}" ]]; then MRL+=":${DVD_CHAPTER}"; fi
+    fi
+else
+    MRL="${DVD_PATH}"
+fi
+
+# Output format: file extension and ffmpeg options
+OUTFORMAT="${FORMAT:-flac}"
+case "${OUTFORMAT}" in
+    flac|flc) EXT=flac; FMT_OPTS=( -c:a flac -f flac ) ;;
+    pcm)      EXT=pcm;  FMT_OPTS=( -c:a pcm_s16le -f s16le ) ;;
+    wav)      EXT=wav;  FMT_OPTS=( -c:a pcm_s16le -f wav ) ;;
+    mp3)      EXT=mp3;  FMT_OPTS=( -c:a libmp3lame -b:a "${BITRATE:-192}k" -f mp3 ) ;;
+    *)        die "Unknown format '${OUTFORMAT}' (-f): use flac, pcm, wav or mp3" ;;
+esac
+OUT="${LOGDIR}/test.${EXT}"
+
+detail "  Options: mac=${PLAYER_MAC} format=${FORMAT} mode=${MODE} start=${START} duration=${DURATION} bitrate=${BITRATE}"
+log "  Source: ${DVD_PATH/*music/Music Folder}"
+if (( VIDEO_FILE )); then log "  Video file (no disc title)"; fi
+if (( IS_DVD )); then
+    if [[ -n "${DVD_TITLE}" ]]; then log "  Title: ${DVD_TITLE}"; else log "  Title: (VLC default)"; fi
+    if [[ -n "${DVD_CHAPTER}" ]]; then log "  Chapter: ${DVD_CHAPTER}"; fi
+fi
+log "  Output format: ${OUTFORMAT^^}"
+detail "  Output: ${OUT}"
+detail "  Pipe: ${FIFO}"
+detail "  Socket: ${SOCK} (oldrc)"
+detail "  Logs: ${LOGDIR}"
+
+# ------------------------------------------------------------------------------
+# Pre-flight checks
+# ------------------------------------------------------------------------------
+command -v ffmpeg &>/dev/null || die "ffmpeg not found in PATH."
+command -v cvlc   &>/dev/null || die "cvlc not found in PATH."
+
+rm -f "${FIFO}" "${SOCK}" "${OUT}"
+mkfifo "${FIFO}" || die "Cannot create the pipe ${FIFO}"
+
+# ------------------------------------------------------------------------------
+# Build and run the commands: ffmpeg first (it waits on the pipe until VLC opens it, and ends
+# when VLC closes it), then VLC
+# ------------------------------------------------------------------------------
+FFMPEG_CMD=( ffmpeg -nostdin -hide_banner -v "${FFLEVEL}" -nostats -y -readrate 1
+             -f s16le -ar 48000 -ac 2 -i "${FIFO}" -vn "${FMT_OPTS[@]}" "${OUT}" )
+
+VLC_CMD=( cvlc -I dummy --no-dbus --no-video --no-sout-video --no-sout-spu --play-and-exit
+          --extraintf=oldrc --rc-fake-tty "--rc-unix=${SOCK}" )
+if (( DVD_MENU_OFF )); then VLC_CMD+=( --no-dvdnav-menu ); fi
+VLC_CMD+=( "${MRL}"
+           --sout "#transcode{acodec=s16l,channels=2,samplerate=48000}:std{access=file,mux=raw,dst=${FIFO}}" )
+
+detail "  ffmpeg command: $(printf '%q ' "${FFMPEG_CMD[@]}")"
+detail "  VLC command: $(printf '%q ' "${VLC_CMD[@]}")"
+
+"${FFMPEG_CMD[@]}" >> "${FFLOG}" 2>&1 &
+FF_PID=$!
+"${VLC_CMD[@]}" >> "${VLCLOG}" 2>&1 &
+VLC_PID=$!
+
+# ffmpeg ends at the end of the audio. If VLC ends first without ever opening the pipe (a bad
+# input), ffmpeg would wait for ever: it gets 5 s, then it is stopped.
+gone=0
+while kill -0 "${FF_PID}" 2>/dev/null; do
+    if ! kill -0 "${VLC_PID}" 2>/dev/null; then
+        (( ++gone ))
+        if (( gone > 25 )); then
+            log "  VLC ended and ffmpeg got no more audio for 5 s: ffmpeg stopped"
+            kill -KILL "${FF_PID}" 2>/dev/null || true
+            FF_STOPPED=1
+        fi
+    fi
+    sleep 0.2
+done
+
+rc=0
+wait "${FF_PID}" || rc=$?
+
+# VLC must not stay behind
+vlc_note=""
+if kill -0 "${VLC_PID}" 2>/dev/null; then
+    vlc_note=" (killed)"
+    kill -KILL "${VLC_PID}" 2>/dev/null || true
+fi
+vrc=0
+wait "${VLC_PID}" || vrc=$?
+detail "  ffmpeg exit: ${rc}, VLC exit: ${vrc}${vlc_note}"
+
+# a VLC that failed (and so produced no audio) is a failure even if ffmpeg ended cleanly
+if (( rc == 0 && vrc != 0 )) && [[ -z "${vlc_note}" ]]; then rc=1; fi
+if (( FF_STOPPED )); then rc=1; fi
+
+exit "${rc}"     # → clean_exit logs the status, merges the logs, removes the temp files

@@ -1,0 +1,29 @@
+@font-face {
+	font-family: 'Ubuntu';
+	font-style: normal;
+	font-weight: 400;
+	src: local('Ubuntu'),
+		url('../fonts/Ubuntu_400.woff') format('woff'),
+		url('../fonts/Ubuntu_400.ttf') format('truetype');
+}
+@font-face {
+	font-family: 'Ubuntu';
+	font-style: normal;
+	font-weight: 700;
+	src: local('Ubuntu Bold'), local('Ubuntu-Bold'),
+		url('../fonts/Ubuntu_700.woff') format('woff'),
+		url('../fonts/Ubuntu_700.ttf') format('truetype');
+}
+@font-face {
+	font-family: 'Ubuntu Mono';
+	font-style: normal;
+	font-weight: 400;
+	src: local('Ubuntu Mono'), local('UbuntuMono-Regular'),
+		url('../fonts/Ubuntu_Mono_400.woff') format('woff'),
+		url('../fonts/Ubuntu_Mono_400.ttf') format('truetype');
+}
+
+body, input, select, textarea, button,
+.x-btn button, .x-menu-list-item, .x-form-field, .x-tab-strip span.x-tab-strip-text {
+	font-family: Ubuntu, sans-serif !important;
+}

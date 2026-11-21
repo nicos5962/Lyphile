@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# FFmpeg-Player
+# Lyrion plugin helper: ffmpeg reads the input (a media file, a DVD image, a VIDEO_TS folder), mixes it down to
+# stereo, applies the live filters (audio stream selection, equalizer) and writes the audio to stdout, in the
+# format of the -f option (flac, pcm, wav, mp3; flac when it is missing). Nothing else goes to stdout: the logs
+# go to files. Same command line as vlc-Player and vlc-Player-lua, so the rules of the plugin use all three.
+#
+# Usage:
+#   FFmpeg-Player -m <MAC> -f <format> [-M mode] [-s start] [-d duration] [-B kbps] "<input>"
+#
+# <input>, the LAST argument:
+#   /path/to/file.mkv                           a plain media file
+#   /path/to/disc.iso | .img                    a DVD image (ffmpeg's dvdvideo demuxer, its longest title)
+#   dvd:///path/to/disc.iso?title=4             a DVD title (ISO, image or VIDEO_TS folder)
+#   dvd:///path/to/disc.iso?title=4&chapter=2   ... from a chapter (numbers from 1)
+#   dvd:///path/to/VIDEO_TS/VTS_01_1.VOB?title=4   a VOB of a VIDEO_TS folder: the folder is used
+#   dvd:///path/to/file.mkv?title=1             a plain media file ("title" is a placeholder)
+#
+# Options of the convert rule (the rules the plugin makes for the player):
+#   -m <mac>        player id          -f <format>   flc | pcm | wav | mp3
+#   -M <mode>       (unused)           -s <seconds>  start time (Lyrion restarts the stream there to seek)
+#   -d <seconds>    duration           -B <kbps>     mp3 bitrate
+#
+# Preferences of the player, asked of Lyrion through Bin/jsonrpc (plugin.lyphile:<name>):
+#   tc_bits (16 | 24), tc_rate (44100 | 48000 | 96000)    the PCM that is written (always stereo)
+#   zmq_port        tcp://127.0.0.1:<port>, where ffmpeg listens for the live commands of the player page
+#   eq_enabled (0 | 1), eq_gain (dB), eq_bands (10 values in dB, separated by spaces): the equalizer at start
+#
+# Filter graph (all inputs are brought to the same rate and to stereo first, so that astreamselect can switch):
+#   [0:a:i] aresample+aformat -> astreamselect@sel (one input per audio stream) -> azmq (commands) -> volume@pre ->
+#   equalizer@eq0 ... equalizer@eq9 -> aresample (soxr, dither) -> output
+# Commands, sent by the player page with zmqsend:   astreamselect@sel map <i>    volume@pre volume <dB>
+#   equalizer@eq<n> gain <dB>
+#
+# Logs of a player, in /config/logs/lyphile/remote_players/<mac with dashes>/:
+#   ffmpeg-report.log     ffmpeg's report (level verbose): the input dump with its streams and chapters, the graph,
+#                         "Map input stream N to output stream 0" after each switch. The player page reads it.
+#   progress.log          ffmpeg's -progress output (time, size, bitrate, speed), one block per second
+#   ffmpeg-transcode-<mac>.log  this run, in the layout of the other helpers (emptied at every start)
+#   transcode.log         every run: the log above is appended to it when the run ends
+# The report, the progress file and audio-streams.txt are removed when the run ends (KEEP_LOGS=1 keeps them).
+# ==============================================================================
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+VERSION="1.0.0"
+DIR="${LYPHILE_BASEDIR:-/config/prefs/Lyphile}"        # only if the player folder cannot be created
+LOGBASE="${LYPHILE_LOGBASE:-/config/logs/lyphile/remote_players}"
+JSONRPC="${LYPHILE_JSONRPC:-$(dirname "$(readlink -f "$0")")/jsonrpc}"
+
+# ffmpeg report level: 32 = info, 40 = verbose (the filter graph and the stream mapping are in it)
+FFREPORT_LEVEL=40
+
+# input read speed (x real time): keeps ffmpeg at the pace of the playback, so that the position it reports is the
+# playing position and a stop or a switch takes effect at once
+READRATE=1
+
+# 1 = more detail in ffmpeg-transcode-<mac>.log
+LOGDETAIL=1
+
+# 0 = when the run ends, the report, the progress file and the stream list of the run are removed (they only serve the
+# player page while ffmpeg runs). 1 = keep them, to read what ffmpeg printed.
+KEEP_LOGS=0
+
+# the ten bands of the equalizer (Hz); octave wide
+EQ_FREQS=( 60 170 310 600 1000 3000 6000 12000 14000 16000 )
+
+# ------------------------------------------------------------------------------
+# Logging helpers: the script's log goes to a per-run block, never to stdout
+# ------------------------------------------------------------------------------
+log() {
+    echo "$*" >> "${LOG}"
+}
+
+detail() {
+    if (( LOGDETAIL )); then log "$*"; fi
+}
+
+# Fatal error: the message goes to stderr, which is captured in LOGTMP and merged into the log by clean_exit.
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+# ------------------------------------------------------------------------------
+# Cleanup: runs on every exit path once the trap is installed
+# ------------------------------------------------------------------------------
+FF_PID="" INTERRUPTED=0
+LOG="" LOGTMP="" LOGMAIN="" REPORT="" PROGRESS="" STREAMS="" PIDFILE=""
+
+kill_children() {
+    if [[ -n "${FF_PID}" ]]; then
+        kill -TERM "${FF_PID}" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "${FF_PID}" 2>/dev/null || return 0
+            sleep 0.1
+        done
+        kill -KILL "${FF_PID}" 2>/dev/null || true
+    fi
+}
+
+clean_exit() {
+    local rc=$?
+    trap - EXIT
+    kill_children
+
+    if (( INTERRUPTED )); then
+        log "  Stream interrupted by client"
+        rc=0        # skip/stop is normal: report success
+    elif (( rc != 0 )) && [[ -s "${REPORT}" ]] && grep -qE 'Broken pipe|received signal' "${REPORT}"; then
+        log "  Stream interrupted by client"
+        rc=0
+    elif (( rc != 0 )) && [[ -s "${REPORT}" ]]; then
+        # a failed run: the error and warning lines of ffmpeg say why
+        local msgs
+        msgs=$(grep -iE 'error|invalid|fail|no such|unable|not found' "${REPORT}" | tail -n 8 | sed 's/^/    /') || true
+        if [[ -n "${msgs}" ]]; then
+            log "  ffmpeg messages:"
+            echo "${msgs}" >> "${LOG}"
+        fi
+    fi
+
+    sed -e '/Broken pipe/d' -e '/Immediate exit requested/d' -e '/Last message repeated/d' -e '/Error closing progress log/d' -e 's/^/  /' "${LOGTMP}" >> "${LOG}" || true
+    log "  Exit status: ${rc}"
+    cat "${LOG}" >> "${LOGMAIN}"
+    rm -f "${LOGTMP}" "${LOG}"
+
+    # the files of the run: only when no later run has taken them over (it writes its own pid in the pid file at start,
+    # and Lyrion can start the next track before this one has ended)
+    if (( ! KEEP_LOGS )) && [[ "$(cat "${PIDFILE}" 2>/dev/null || true)" == "$$" ]]; then
+        rm -f "${REPORT}" "${PROGRESS}" "${STREAMS}" "${PIDFILE}"
+    fi
+    exit "${rc}"
+}
+
+# A signal (Lyrion stopping the stream) ends ffmpeg; clean_exit reports it
+on_signal() {
+    INTERRUPTED=1
+    kill_children
+}
+
+# ------------------------------------------------------------------------------
+# Parse arguments
+# ------------------------------------------------------------------------------
+ARGS="$*"
+PLAYER_MAC="" FORMAT="" MODE="" START="" DURATION="" BITRATE="" BAD=""
+
+while getopts ':m:f:M:s:d:B:' opt; do
+    case "${opt}" in
+        m) PLAYER_MAC="${OPTARG}" ;;
+        f) FORMAT="${OPTARG}" ;;
+        M) MODE="${OPTARG}" ;;
+        s) START="${OPTARG}" ;;
+        d) DURATION="${OPTARG}" ;;
+        B) BITRATE="${OPTARG}" ;;
+        :) BAD+=" missing value for -${OPTARG};" ;;
+        *) BAD+=" unknown option -${OPTARG};" ;;
+    esac
+done
+shift $(( OPTIND - 1 ))
+
+INPUT=""
+for a in "$@"; do INPUT="${a}"; done
+
+if [[ -z "${PLAYER_MAC}" ]]; then
+    PLAYER_MAC="unknown"
+elif [[ ! "${PLAYER_MAC}" =~ ^[0-9A-Fa-f:-]+$ ]]; then
+    BAD+=" invalid player mac;"
+    PLAYER_MAC="unknown"
+fi
+FILE_ID="${PLAYER_MAC//:/-}"       # dash form: safe in file names
+[[ "${START}" =~ ^[0-9]+([.][0-9]+)?$ ]]    || START=""
+[[ "${DURATION}" =~ ^[0-9]+([.][0-9]+)?$ ]] || DURATION=""
+
+# ------------------------------------------------------------------------------
+# Set up the logs, then install the traps and capture stderr
+# ------------------------------------------------------------------------------
+LOGDIR="${LOGBASE}/${FILE_ID}"
+if ! mkdir -p "${LOGDIR}" 2>/dev/null; then
+    LOGDIR="${DIR}"
+    mkdir -p "${LOGDIR}"
+fi
+LOG="${LOGDIR}/ffmpeg-transcode-${FILE_ID}.log"
+LOGMAIN="${LOGDIR}/transcode.log"
+REPORT="${LOGDIR}/ffmpeg-report.log"
+PROGRESS="${LOGDIR}/progress.log"
+STREAMS="${LOGDIR}/audio-streams.txt"
+PIDFILE="${LOGDIR}/ffmpeg-player.pid"
+touch "${LOGMAIN}"
+: > "${LOG}"
+LOGTMP=$(mktemp --tmpdir="${LOGDIR}" --suffix=".tmp" stderr-XXXXXX)
+: > "${REPORT}"
+: > "${PROGRESS}"
+echo "$$" > "${PIDFILE}"
+
+exec 2>> "${LOGTMP}"     # from here on, every error message ends up in the log
+trap clean_exit EXIT     # from here on, every exit path is cleaned up
+trap on_signal TERM INT HUP
+
+log "[${SCRIPT_NAME} v${VERSION}] ${ARGS}"
+log "  Clock: $(date +%H:%M:%S.%3N)"
+if [[ -n "${BAD}" ]]; then log "  Option problems:${BAD}"; fi
+
+# ------------------------------------------------------------------------------
+# Preferences of the player (Lyrion, through Bin/jsonrpc)
+# ------------------------------------------------------------------------------
+pref() {
+    "${JSONRPC}" "${FILE_ID//-/:}" playerpref "plugin.lyphile:$1" '?' | jq -r '.result._p2 // empty' 2>/dev/null || true
+}
+
+TC_BITS=16 TC_RATE=48000 ZMQ_PORT="" EQ_ENABLED=0 EQ_GAIN=0
+EQ_BANDS=( 0 0 0 0 0 0 0 0 0 0 )
+if [[ -x "${JSONRPC}" && "${PLAYER_MAC}" != "unknown" ]]; then
+    v=$(pref tc_bits);  [[ "${v}" == 16 || "${v}" == 24 ]] && TC_BITS="${v}"
+    v=$(pref tc_rate);  [[ "${v}" == 44100 || "${v}" == 48000 || "${v}" == 96000 ]] && TC_RATE="${v}"
+    v=$(pref zmq_port); [[ "${v}" =~ ^tcp://127\.0\.0\.1:[0-9]+$ ]] && ZMQ_PORT="${v}"
+    v=$(pref eq_enabled); [[ "${v}" == 1 ]] && EQ_ENABLED=1
+    v=$(pref eq_gain);    [[ "${v}" =~ ^-?[0-9]{1,2}(\.[0-9])?$ ]] && EQ_GAIN="${v}"
+    v=$(pref eq_bands)
+    if [[ -n "${v}" ]]; then
+        read -r -a vals <<< "${v}"
+        for i in 0 1 2 3 4 5 6 7 8 9; do
+            [[ "${vals[i]:-}" =~ ^-?[0-9]{1,2}(\.[0-9])?$ ]] && EQ_BANDS[i]="${vals[i]}"
+        done
+    fi
+fi
+# a seek the player page asked for (a chapter of a DVD title: Lyrion can not seek those): "<seconds>@<epoch>", used when
+# no start time was given by Lyrion and it is recent (15 s). It is not cleared: Lyrion can start the transcoder more
+# than once for one request, and every start has to begin at the chapter.
+if [[ -z "${START}" && -x "${JSONRPC}" && "${PLAYER_MAC}" != "unknown" ]]; then
+    v=$(pref seek_start)
+    if [[ "${v}" =~ ^([0-9]+)@([0-9]+)$ ]]; then
+        if (( $(date +%s) - BASH_REMATCH[2] <= 15 )); then START="${BASH_REMATCH[1]}"; fi
+    fi
+fi
+if (( ! EQ_ENABLED )); then
+    EQ_GAIN=0
+    EQ_BANDS=( 0 0 0 0 0 0 0 0 0 0 )
+fi
+
+# ------------------------------------------------------------------------------
+# The input: a DVD URI, a DVD image, or a plain media file
+# ------------------------------------------------------------------------------
+[[ -n "${INPUT}" ]] || die "No input given."
+
+DVD_PATH="" DVD_TITLE="" DVD_CHAPTER="" IS_DVD=0
+
+url_decode() {
+    local s="${1//\\/%5C}"
+    printf '%b' "${s//%/\\x}"
+}
+
+if [[ "${INPUT}" == dvd://* ]]; then
+    # dvd:///path/to/file.iso?title=4[&chapter=2]
+    uri_no_scheme="${INPUT#dvd://}"
+    uri_path="${uri_no_scheme%%\?*}"
+    uri_query=""
+    if [[ "${uri_no_scheme}" == *\?* ]]; then uri_query="${uri_no_scheme#*\?}"; fi
+    DVD_PATH="$(url_decode "${uri_path}")"
+
+    if [[ "${uri_query}" =~ (^|[\&])title=([^\&]+) ]]; then
+        DVD_TITLE="${BASH_REMATCH[2]}"
+    else
+        die "DVD URI must contain '?title=<N>' (query: ${uri_query})"
+    fi
+    [[ "${DVD_TITLE}" =~ ^[0-9]+$ ]] || die "Invalid title: ${DVD_TITLE}"
+
+    if [[ "${uri_query}" =~ (^|[\&])chapter=([^\&]+) ]]; then
+        DVD_CHAPTER="${BASH_REMATCH[2]}"
+        [[ "${DVD_CHAPTER}" =~ ^[0-9]+$ ]] || die "Invalid chapter: ${DVD_CHAPTER}"
+    fi
+
+    # If the path ends with a .VOB file, remove the filename
+    if [[ "${DVD_PATH}" =~ /VIDEO_TS/[^/]+\.[Vv][Oo][Bb]$ ]]; then
+        DVD_PATH="${DVD_PATH%/*}"
+    fi
+    IS_DVD=1
+else
+    DVD_PATH="${INPUT}"
+    if [[ -e "${DVD_PATH}" && ( "${DVD_PATH,,}" =~ \.(iso|img)$ || -d "${DVD_PATH}" ) ]]; then
+        IS_DVD=1
+    fi
+fi
+
+# A plain video file (not a disc image or VIDEO_TS folder) is read as it is: the "title" of its URL is a placeholder
+VIDEO_FILE=0
+if (( IS_DVD )) && [[ -f "${DVD_PATH}" ]] \
+   && [[ "${DVD_PATH,,}" =~ \.(mkv|mka|mk3d|webm|mp4|m4v|ts|m2ts|mts|avi|mpg|mpeg)$ ]]; then
+    VIDEO_FILE=1
+    IS_DVD=0
+fi
+
+[[ -e "${DVD_PATH}" ]] || die "Source not found: ${DVD_PATH}"
+
+# ffmpeg's options for the input: a disc is read by the dvdvideo demuxer
+PROBE_OPTS=() INPUT_OPTS=()
+if (( IS_DVD )); then
+    PROBE_OPTS=( -f dvdvideo )
+    if [[ -n "${DVD_TITLE}" ]]; then PROBE_OPTS+=( -title "${DVD_TITLE}" ); fi
+    if [[ -n "${DVD_CHAPTER}" ]]; then PROBE_OPTS+=( -chapter_start "${DVD_CHAPTER}" ); fi
+    INPUT_OPTS=( "${PROBE_OPTS[@]}" )
+fi
+
+# Output format: ffmpeg options of the encoder
+OUTFORMAT="${FORMAT:-flac}"
+SAMPLE_FMT="s16"; (( TC_BITS == 24 )) && SAMPLE_FMT="s32"
+case "${OUTFORMAT}" in
+    flac|flc) FMT_OPTS=( -c:a flac -f flac ) ;;
+    pcm)      FMT_OPTS=( -c:a "pcm_s${TC_BITS}le" -f "s${TC_BITS}le" ) ;;
+    wav)      FMT_OPTS=( -c:a "pcm_s${TC_BITS}le" -f wav ) ;;
+    mp3)      FMT_OPTS=( -c:a libmp3lame -b:a "${BITRATE:-192}k" -f mp3 ) ;;
+    *)        die "Unknown format '${OUTFORMAT}' (-f): use flac, pcm, wav or mp3" ;;
+esac
+
+log "  Source: ${DVD_PATH/*music/Music Folder}"
+if (( VIDEO_FILE )); then log "  Video file (no disc title)"; fi
+if (( IS_DVD )); then
+    if [[ -n "${DVD_TITLE}" ]]; then log "  Title: ${DVD_TITLE}"; else log "  Title: (ffmpeg default)"; fi
+    if [[ -n "${DVD_CHAPTER}" ]]; then log "  Chapter: ${DVD_CHAPTER}"; fi
+fi
+log "  Output format: ${OUTFORMAT^^}, PCM ${TC_BITS} bit ${TC_RATE} Hz stereo"
+if [[ -n "${START}" ]]; then log "  Start: ${START} s"; fi
+
+# ------------------------------------------------------------------------------
+# Pre-flight checks
+# ------------------------------------------------------------------------------
+command -v ffmpeg  &>/dev/null || die "ffmpeg not found in PATH."
+command -v ffprobe &>/dev/null || die "ffprobe not found in PATH."
+command -v jq      &>/dev/null || die "jq not found in PATH."
+
+# soxr (a better resampler) when this ffmpeg has it
+RESAMPLER=""
+if ffmpeg -hide_banner -buildconf 2>&1 | grep -q -- '--enable-libsoxr'; then RESAMPLER="resampler=soxr:"; fi
+
+# ------------------------------------------------------------------------------
+# The audio streams of the input
+# ------------------------------------------------------------------------------
+mapfile -t ALL_AUDIO < <(ffprobe -v error "${PROBE_OPTS[@]}" -select_streams a -show_entries stream=index -of csv=p=0 \
+                          -i "${DVD_PATH}" 2>/dev/null < /dev/null | sort -n || true)
+(( ${#ALL_AUDIO[@]} > 0 )) || die "No audio stream found in ${DVD_PATH}${DVD_TITLE:+ title ${DVD_TITLE}}"
+
+# astreamselect waits for a frame on every one of its inputs, so a stream that has no data at the start (a disc can
+# have such an audio track: PCM that starts much later) would hold the whole graph. Only the streams that have
+# packets in the first 3 s (from the start time) go into the graph: they are the ones the player page can select.
+mapfile -t HAVE_DATA < <(ffprobe -v error "${PROBE_OPTS[@]}" -select_streams a -read_intervals "${START:-0}%+3" \
+                         -show_entries packet=stream_index -of csv=p=0 -i "${DVD_PATH}" 2>/dev/null < /dev/null | sort -un || true)
+LIVE_AUDIO=()
+for idx in "${ALL_AUDIO[@]}"; do
+    for have in "${HAVE_DATA[@]}"; do
+        if [[ "${have}" == "${idx}" ]]; then LIVE_AUDIO+=( "${idx}" ); break; fi
+    done
+done
+if (( ${#LIVE_AUDIO[@]} == 0 )); then LIVE_AUDIO=( "${ALL_AUDIO[@]}" ); fi
+AUDIO_COUNT=${#LIVE_AUDIO[@]}
+echo "${LIVE_AUDIO[*]}" > "${STREAMS}"      # the player page lists these (position = input of astreamselect)
+log "  Audio streams: ${#ALL_AUDIO[@]}, in the graph: ${AUDIO_COUNT} (stream numbers ${LIVE_AUDIO[*]})"
+
+# ------------------------------------------------------------------------------
+# The filter graph
+# ------------------------------------------------------------------------------
+# azmq endpoint: ':' must be escaped twice in a filtergraph (option level + graph level)
+ZMQ_FILTER=""
+if [[ -n "${ZMQ_PORT}" ]]; then
+    ZMQ_ENDPOINT="${ZMQ_PORT//:/\\\\:}"
+    ZMQ_FILTER="azmq=bind_address=${ZMQ_ENDPOINT},"
+    log "  ZMQ endpoint: ${ZMQ_PORT}"
+else
+    log "  No zmq endpoint (pref zmq_port): the player page can not change the filters while playing"
+fi
+
+# the endpoint is the player's: a run that is still ending (Lyrion starts the next track as the old one stops) holds it,
+# and azmq could not bind. Wait for it, up to 5 s.
+if [[ -n "${ZMQ_PORT}" ]]; then
+    zmq_tcp="${ZMQ_PORT#tcp://127.0.0.1:}"
+    for _ in $(seq 1 50); do
+        if ! ( exec 3<>"/dev/tcp/127.0.0.1/${zmq_tcp}" ) 2>/dev/null; then break; fi
+        sleep 0.1
+    done
+fi
+
+GRAPH="" LABELS=""
+for (( i = 0; i < AUDIO_COUNT; i++ )); do
+    GRAPH+="[0:${LIVE_AUDIO[i]}]aresample=${RESAMPLER}osr=${TC_RATE},aformat=sample_fmts=fltp:sample_rates=${TC_RATE}:channel_layouts=stereo[s${i}];"
+    LABELS+="[s${i}]"
+done
+if (( AUDIO_COUNT > 1 )); then
+    GRAPH+="${LABELS}astreamselect@sel=inputs=${AUDIO_COUNT}:map=0[m];"     # astreamselect needs two inputs or more
+else
+    GRAPH+="${LABELS}anull[m];"
+fi
+
+CHAIN="${ZMQ_FILTER}volume@pre=volume=${EQ_GAIN}dB"
+for (( b = 0; b < 10; b++ )); do
+    CHAIN+=",equalizer@eq${b}=f=${EQ_FREQS[b]}:t=o:w=1:g=${EQ_BANDS[b]}"
+done
+CHAIN+=",aresample=${RESAMPLER}osr=${TC_RATE}:dither_method=triangular_hp,aformat=sample_fmts=${SAMPLE_FMT}:sample_rates=${TC_RATE}:channel_layouts=stereo"
+GRAPH+="[m]${CHAIN}[out]"
+
+# ------------------------------------------------------------------------------
+# Build and run ffmpeg
+# ------------------------------------------------------------------------------
+FF_CMD=( ffmpeg -nostdin -hide_banner -v error -nostats -y -progress "${PROGRESS}" -stats_period 1 )
+if [[ -n "${START}" ]]; then FF_CMD+=( -ss "${START}" ); fi
+FF_CMD+=( -readrate "${READRATE}" "${INPUT_OPTS[@]}" -i "${DVD_PATH}" )
+FF_CMD+=( -filter_complex "${GRAPH}" -map "[out]" -vn )
+if [[ -n "${DURATION}" ]]; then FF_CMD+=( -t "${DURATION}" ); fi
+FF_CMD+=( "${FMT_OPTS[@]}" pipe:1 )
+
+detail "  Command: $(printf '%q ' "${FF_CMD[@]}")"
+
+# stdout stays the script's stdout: the audio. ffmpeg runs as a background job so the shell can forward the signals.
+FFREPORT="file=${REPORT}:level=${FFREPORT_LEVEL}" "${FF_CMD[@]}" &
+FF_PID=$!
+
+# a trapped signal interrupts `wait`, so loop until ffmpeg is really gone
+rc=0
+while kill -0 "${FF_PID}" 2>/dev/null; do
+    wait "${FF_PID}" && rc=0 || rc=$?
+done
+FF_PID=""
+detail "  ffmpeg exit: ${rc}"
+
+exit "${rc}"     # → clean_exit logs the status, merges the logs, removes the temp files

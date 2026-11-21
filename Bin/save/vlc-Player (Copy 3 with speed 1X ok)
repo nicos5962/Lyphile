@@ -1,0 +1,104 @@
+#!/bin/sh
+# vlc-Player, basic version: VLC plays the input file and writes raw PCM (s16le, 48 kHz, stereo)
+# to a named pipe, ffmpeg reads the pipe and writes
+#   /config/prefs/Lyphile/test.<ext>    (log: /config/prefs/Lyphile/test.log)
+# in the format of the -f option (flac, pcm, wav, mp3; flac when it is missing). ffmpeg reads the
+# pipe at 1x (-readrate 1): the full pipe holds VLC back, so VLC plays at normal speed.
+# The pipe is /config/prefs/Lyphile/<player mac, dashes>.fifo. Nothing goes to stdout. The input
+# file is the LAST argument. VLC ends itself when the file is finished (--play-and-exit); the
+# script also kills VLC and ffmpeg on any exit and removes the pipe.
+
+DIR=/config/prefs/Lyphile
+LOG=$DIR/test.log
+
+mkdir -p "$DIR"
+: > "$LOG"
+
+# VLC wants a writable home for its config
+export HOME=/tmp/vlchome
+mkdir -p "$HOME"
+
+# options of the convert rule (custom-convert.conf):
+#   -m <mac>        player id          -f <format>   flc | pcm | wav | mp3
+#   -M <mode>       sout | aout        -s <seconds>  start time
+#   -d <seconds>    duration           -B <kbps>     mp3 bitrate
+# The input file is what is left after the options. They are parsed only: nothing uses them yet.
+ARGS=$*
+MAC= FORMAT= MODE= START= DURATION= BITRATE= BAD=
+while getopts ':m:f:M:s:d:B:' opt; do
+	case $opt in
+		m) MAC=$OPTARG ;;
+		f) FORMAT=$OPTARG ;;
+		M) MODE=$OPTARG ;;
+		s) START=$OPTARG ;;
+		d) DURATION=$OPTARG ;;
+		B) BITRATE=$OPTARG ;;
+		:) BAD="$BAD missing value for -$OPTARG;" ;;
+		*) BAD="$BAD unknown option -$OPTARG;" ;;
+	esac
+done
+shift $((OPTIND - 1))
+for a in "$@"; do FILE=$a; done
+
+# output format: file extension and ffmpeg options
+case ${FORMAT:-flac} in
+	flac|flc) EXT=flac; FMT_OPTS="-c:a flac -f flac" ;;
+	pcm)      EXT=pcm;  FMT_OPTS="-c:a pcm_s16le -f s16le" ;;
+	wav)      EXT=wav;  FMT_OPTS="-c:a pcm_s16le -f wav" ;;
+	mp3)      EXT=mp3;  FMT_OPTS="-c:a libmp3lame -b:a ${BITRATE:-192}k -f mp3" ;;
+	*)
+		echo "args: $ARGS" >> "$LOG"
+		echo "unknown format '$FORMAT' (-f): use flac, pcm, wav or mp3" >> "$LOG"
+		exit 1
+		;;
+esac
+OUT=$DIR/test.$EXT
+rm -f "$OUT"
+
+FIFO=$DIR/$(echo "${MAC:-unknown}" | tr ':' '-').fifo
+
+if [ ! -f "$FILE" ]; then
+	echo "args: $ARGS" >> "$LOG"
+	echo "the last argument is not an existing file: '$FILE'" >> "$LOG"
+	exit 1
+fi
+
+{
+	echo "start:  $(date '+%F %T')"
+	echo "args:   $ARGS"
+	echo "input:  $FILE"
+	echo "options: mac=$MAC format=$FORMAT mode=$MODE start=$START duration=$DURATION bitrate=$BITRATE"
+	[ -n "$BAD" ] && echo "option problems:$BAD"
+	echo "output: $OUT ($FMT_OPTS)"
+	echo "pipe:   $FIFO"
+} >> "$LOG"
+
+rm -f "$FIFO"
+if ! mkfifo "$FIFO" 2>> "$LOG"; then
+	echo "cannot create the pipe $FIFO" >> "$LOG"
+	exit 1
+fi
+
+# ffmpeg first: it waits on the pipe until VLC opens it, and it ends when VLC closes it
+ffmpeg -nostdin -hide_banner -v error -y -readrate 1 -f s16le -ar 48000 -ac 2 -i "$FIFO" -vn $FMT_OPTS "$OUT" \
+	>> "$LOG" 2>&1 &
+FFMPEG=$!
+
+cvlc -I dummy --no-dbus --no-video --no-sout-video --no-sout-spu --play-and-exit \
+	"$FILE" \
+	--sout "#transcode{acodec=s16l,channels=2,samplerate=48000}:std{access=file,mux=raw,dst=$FIFO}" \
+	>> "$LOG" 2>&1 &
+VLC=$!
+
+trap 'kill -KILL $VLC $FFMPEG 2>/dev/null; rm -f "$FIFO"' EXIT INT TERM
+
+# ffmpeg ends at the end of the audio (or when VLC dies); then VLC must not stay behind
+wait $FFMPEG
+RC=$?
+kill -KILL $VLC 2>/dev/null
+wait $VLC 2>/dev/null
+VRC=$?
+
+rm -f "$FIFO"
+echo "ffmpeg exit: $RC, vlc exit: $VRC at $(date '+%F %T')" >> "$LOG"
+exit $RC
