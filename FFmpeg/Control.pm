@@ -71,7 +71,7 @@ sub init {
 
 		Slim::Web::Pages->addPageFunction("plugins/Lyphile/ffmpeg/$name", sub {
 			my ($client, $params, $callback, $httpClient, $httpResponse) = @_;
-			_send_json($httpClient, $httpResponse, $handler->($params));
+			return _send_json($httpClient, $httpResponse, $handler->($params));
 		});
 	}
 }
@@ -84,8 +84,9 @@ sub _send_json {
 	my $json = encode_json($data);
 	$httpResponse->code(RC_OK);
 	$httpResponse->content_type('application/json');
-	$httpResponse->content_length(length($json));
-	Slim::Web::HTTP::addHTTPResponse($httpClient, $httpResponse, \$json, undef, undef);
+	# the server sends the answer when the page function returns the reference to its body: sending it here as
+	# well would answer the next request of the connection twice
+	return \$json;
 }
 
 # ($client, $mac with colons) of a player given as in the request, or ()

@@ -39,6 +39,17 @@ sub handler {
 
 	return $class->SUPER::handler($client, $params) unless $client;
 
+	# Bit depth and Sample rate of the Control tab are the settings of this page: they are saved with Apply (or Yes
+	# when the page is left). They are read when a track starts, so they are refused while a track plays.
+	if ($params->{saveSettings} && (defined $params->{tc_bits} || defined $params->{tc_rate})) {
+		my $res = Plugins::Lyphile::VLC::ControlLua::_tc({ player => $client->id, bits => $params->{tc_bits}, rate => $params->{tc_rate} });
+
+		unless ($res && $res->{ok}) {
+			my $why = ($res && $res->{error}) || 'failed';
+			$params->{warning} .= 'Bit depth and Sample rate not saved: ' . ($why eq 'playing' ? 'a track is playing, stop it first' : $why) . '. ';
+		}
+	}
+
 	return $class->SUPER::handler($client, $params);
 }
 

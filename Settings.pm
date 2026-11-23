@@ -43,20 +43,19 @@ sub _killProcesses {
 	my $json = encode_json({ ok => JSON::XS::true, found => scalar(@pids), killed => $killed + 0 });
 	$httpResponse->code(RC_OK);
 	$httpResponse->content_type('application/json');
-	$httpResponse->content_length(length($json));
-	Slim::Web::HTTP::addHTTPResponse($httpClient, $httpResponse, \$json, undef, undef);
+	return \$json;
 }
 
 # POST plugins/Lyphile/killvlc: every process named "vlc" (cvlc runs as vlc)
 sub killVlcHandler {
 	my ($client, $params, $callback, $httpClient, $httpResponse) = @_;
-	_killProcesses('vlc', $httpClient, $httpResponse);
+	return _killProcesses('vlc', $httpClient, $httpResponse);
 }
 
 # POST plugins/Lyphile/killmpv: every process named "mpv"
 sub killMpvHandler {
 	my ($client, $params, $callback, $httpClient, $httpResponse) = @_;
-	_killProcesses('mpv', $httpClient, $httpResponse);
+	return _killProcesses('mpv', $httpClient, $httpResponse);
 }
 
 # Per-player log files written by the transcoder: <log dir>/lyphile/remote_players/<mac>/<file>
@@ -119,12 +118,16 @@ sub logHandler {
 	return Slim::Web::Pages::Common->logFileViewer($client, $params, $httpClient, $response, $entry->{file})
 		if $entry;
 
-	# a page function answers with a reference to the body, never a plain string (Lyrion then fails on the request and the
-	# client waits for ever, or gets the next answer of its connection mixed up)
+	# a page function answers by returning a reference to the body, never a plain string, and it must not send the answer
+	# itself as well: the server sends what the function returns, so both together answer the next request of the
+	# connection with the wrong answer
+	$log->warn(sprintf("log page: no log for mac='%s' type='%s' (logs found: %s, dir: %s)",
+		$params->{mac} // '', $params->{type} // '', join(', ', sort keys %{ playerLogs() }) || 'none', Plugins::Lyphile::Plugin::logDir()));
+
 	my $body = 'Log not found';
 	$response->code(RC_NOT_FOUND);
 	$response->content_type('text/plain; charset=utf-8');
-	return Slim::Web::HTTP::prepareResponseForSending($client, $params, \$body, $httpClient, $response);
+	return \$body;
 }
 
 # Executable files of the plugin's Bin folder (sub folders and the jsonrpc helper are left out)

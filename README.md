@@ -38,8 +38,22 @@ Copy the `Lyphile` folder into the `Plugins` directory of the server cache (for 
 
 `Bin/save`, `Bin/save3` and `HTML/EN/plugins/Lyphile/settings/vlc/save` are older copies kept as backups.
 
+## Changelog
+
+### 1.1
+- Bug fix: the VLC player page no longer shows for a player set to "none" (it shows only for the `vlc-Player` helper).
+- Bug fix (VLC oldrc): a pause followed by a resume left VLC paused for good, so VLC, ffmpeg and the helper stayed running and the player page kept reporting "oldrc interface active" while another track played. A paused VLC is now recognised, so it resumes and is cleaned up.
+- Bug fix: the answers of the JSON endpoints of the player pages (`vlc`, `vlclua`, `mpv`, `ffmpeg`), of the kill buttons and of the log page were sent twice, so on a browser connection that is kept open the answer to the next request was the wrong one. Symptoms: the playlist panel or a page showing raw JSON, a log page showing garbage, now and then. Every endpoint now returns its answer once.
+- Bug fix: on every player page (VLC, VLC Lua, mpv, ffmpeg), after switching an audio stream or chapter, opening another tab of the settings asked to save the settings. The settings page of the server counts a control as changed when its value differs from its `defaultValue` (a select has none); the controls of these pages now report their current value as default, as there is nothing to save on them.
+- Change: Bit depth and Sample rate (Control tab of the VLC, VLC Lua, mpv and ffmpeg pages) are now saved with the Apply button instead of at once. Changing one and then opening another sub tab or another tab of the Settings asks "Some settings were changed. Do you want to save them?" (Yes saves, No puts back the saved values, Cancel stays). A value is still refused while a track plays. The other controls of the pages act at once and never ask.
+- Improved "Now playing" frame on the main page: the bitrate line shows the details of the audio stream being played (as on the player page, text between parentheses left out) and follows an audio-stream switch.
+- A log page that cannot find a log now writes the requested player and type to the server log.
+
+### 1.0
+- First release.
+
 ## Version
-1.0
+1.1
 
 ## Author
 nicos

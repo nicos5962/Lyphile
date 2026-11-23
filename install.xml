@@ -3,7 +3,7 @@
 <extension>
 	<name>PLUGIN_LYPHILE</name>
 	<module>Plugins::Lyphile::Plugin</module>
-	<version>1.0</version>
+	<version>1.1</version>
 	<description>PLUGIN_LYPHILE_DESC</description>
 	<creator>Lyphile</creator>
 	<defaultState>enabled</defaultState>

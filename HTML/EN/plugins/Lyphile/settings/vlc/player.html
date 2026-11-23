@@ -82,8 +82,8 @@
 	<div class="vlc-panel" id="vlc_p_control" style="display:none;">
 		[% WRAPPER settingGroup title="Transcode" desc="PCM that VLC sends to ffmpeg, always stereo (downmix). Applies to the next track: it cannot be changed while a track is playing." %]
 			<table class="vlc-kv">
-				<tr><td><label for="tc_bits">Bit depth:</label></td><td><select id="tc_bits"><option value="16">16 bit</option><option value="24">24 bit</option></select></td></tr>
-				<tr><td><label for="tc_rate">Sample rate:</label></td><td><select id="tc_rate"><option value="44100">44100 Hz</option><option value="48000">48000 Hz</option><option value="96000">96000 Hz</option></select></td></tr>
+				<tr><td><label for="tc_bits">Bit depth:</label></td><td><select id="tc_bits" name="tc_bits"><option value="16">16 bit</option><option value="24">24 bit</option></select></td></tr>
+				<tr><td><label for="tc_rate">Sample rate:</label></td><td><select id="tc_rate" name="tc_rate"><option value="44100">44100 Hz</option><option value="48000">48000 Hz</option><option value="96000">96000 Hz</option></select></td></tr>
 			</table>
 			<div id="tc_status" role="status" style="min-height:1.4em;margin-top:4px;font-size:90%;">&nbsp;</div>
 		[% END %]
@@ -98,6 +98,11 @@
 	// tabs: they only show and hide blocks of the page
 	var tabs = document.getElementById('vlc_tabs').getElementsByTagName('li');
 
+	function currentTab() {
+		for (var i = 0; i < tabs.length; i++) if (tabs[i].className === 'vlc-tab-on') return tabs[i].getAttribute('data-tab');
+		return '';
+	}
+
 	function showTab(name) {
 		var known = false, i;
 		for (i = 0; i < tabs.length; i++) if (tabs[i].getAttribute('data-tab') === name) known = true;
@@ -111,8 +116,26 @@
 	}
 	for (var t = 0; t < tabs.length; t++) {
 		tabs[t].onclick = function (ev) {
-			showTab(this.getAttribute('data-tab'));
+			var name = this.getAttribute('data-tab');
 			if (ev && ev.preventDefault) ev.preventDefault();
+			// a changed Bit depth or Sample rate: the same question as when another tab of the Settings is opened
+			var modified = false;
+			try { modified = Settings.Page.isModified(); } catch (e) {}
+			if (modified && name !== currentTab() && window.parent && parent.Settings && parent.Settings._confirmPageChange) {
+				parent.Settings._confirmPageChange(function (btn) {
+					if (btn === 'yes') {
+						showTab(name);              // the page comes back on this tab after it is saved
+						Settings.Page.submit();
+					}
+					else if (btn === 'no') {
+						if (window.lyphileTcRevert) window.lyphileTcRevert();
+						try { Settings.Page.resetModified(); } catch (e) {}
+						showTab(name);
+					}
+				});
+				return false;
+			}
+			showTab(name);
 			return false;
 		};
 	}
@@ -325,7 +348,7 @@
 (function () {
 	'use strict';
 
-	// Transcode settings of the Control tab: saved when changed; disabled while VLC is running (a track plays
+	// Transcode settings of the Control tab: saved with Apply; disabled while VLC is running (a track plays
 	// or is paused). The saved values come with rcstatus, asked every 2 s while the Control tab is shown.
 	var PLAYER = "[% playerid | html %]";
 	var BASE   = "[% webroot %]plugins/Lyphile/vlc/";
@@ -341,25 +364,40 @@
 		}).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
 	}
 
+	// The values saved on the server (they come with rcstatus). Bit depth and Sample rate are real settings: a change is
+	// saved with the Apply button of the Settings page, or with Yes when the page or the tab is left. Until then the
+	// page keeps what the user chose (the values of rcstatus must not put the old ones back).
+	var saved = null, touched = false;   // touched: the user changed one of them since the page was loaded
+	function dirty() { return touched && !!saved && (bits.value !== String(saved.bits) || rate.value !== String(saved.rate)); }
+	function mark() {
+		statusEl.style.color = '#d08000';
+		statusEl.innerHTML = dirty() ? 'Changed: press Apply to save' : '&nbsp;';
+	}
+	// the Settings page counts a control as changed when its value is not its defaultValue: that is the saved value
+	[bits, rate].forEach(function (el, i) {
+		try {
+			Object.defineProperty(el, 'defaultValue', { configurable: true, get: function () { return touched && saved ? String(i ? saved.rate : saved.bits) : el.value; }, set: function () {} });
+		} catch (e) {}
+	});
+	bits.onchange = rate.onchange = function () { touched = true; mark(); };
+
 	function show(res) {
 		running = !!res.active;
 		bits.disabled = rate.disabled = running;
-		if (res.tc && document.activeElement !== bits && document.activeElement !== rate) {
-			bits.value = res.tc.bits;
-			rate.value = res.tc.rate;
+		if (res.tc) {
+			saved = res.tc;
+			if (!touched && document.activeElement !== bits && document.activeElement !== rate) {
+				bits.value = res.tc.bits;
+				rate.value = res.tc.rate;
+				mark();
+			}
 		}
 	}
-
-	function save(params) {
-		post('tc', params).then(function (res) {
-			statusEl.style.color = res.ok ? '#2e9e44' : '#d33';
-			statusEl.textContent = res.ok ? 'Saved' : (res.error === 'playing' ? 'Not saved: a track is playing' : 'Error: ' + (res.error || 'failed'));
-			if (res.tc) show({ active: running, tc: res.tc });
-			else poll();
-		}).catch(function (e) { statusEl.style.color = '#d33'; statusEl.textContent = 'Error: ' + e.message; });
-	}
-	bits.onchange = function () { save({ bits: bits.value }); };
-	rate.onchange = function () { save({ rate: rate.value }); };
+	window.lyphileTcRevert = function () {
+		touched = false;
+		if (saved) { bits.value = saved.bits; rate.value = saved.rate; }
+		mark();
+	};
 
 	function poll() {
 		return post('rcstatus', {}).then(function (res) { if (res.ok) show(res); }).catch(function () {});
@@ -370,6 +408,30 @@
 	}
 	poll();
 	loop();
+})();
+</script>
+
+<script type="text/javascript">
+// The controls of this page act at once (stream, chapter, volume, equalizer ...): there is nothing to save. The
+// Settings page of the server marks a page as changed when the value of one of its controls is not its
+// defaultValue (a select has none), and then asks to save the settings when another tab is opened. So the
+// default value of every control here is always its current value, but Bit depth and Sample rate (Control tab), which
+// are real settings with their own default value: the saved one.
+(function () {
+	function noSave(root) {
+		var form = document.forms.settingsForm;
+		var fields = form ? form.elements : [];
+		for (var i = 0; i < fields.length; i++) {
+			if (fields[i].id === 'tc_bits' || fields[i].id === 'tc_rate') continue;   // the real settings of the page
+			(function (el) {
+				try {
+					Object.defineProperty(el, 'defaultValue', { configurable: true, get: function () { return el.value; }, set: function () {} });
+				} catch (e) {}
+			})(fields[i]);
+		}
+	}
+	noSave();
+	if (window.Ext && Ext.onReady) Ext.onReady(noSave);
 })();
 </script>
 

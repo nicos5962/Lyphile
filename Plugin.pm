@@ -20,6 +20,7 @@ use Plugins::Lyphile::VLC::Control;
 use Plugins::Lyphile::VLC::ControlLua;
 use Plugins::Lyphile::FFmpeg::Control;
 use Plugins::Lyphile::MPV::Control;
+use Plugins::Lyphile::StreamInfo;
 use Plugins::Lyphile::VLC::PlayerSettings;
 use Plugins::Lyphile::VLC::PlayerSettingsLua;
 use Plugins::Lyphile::MPV::PlayerSettings;
@@ -102,6 +103,7 @@ sub initPlugin {
 	Plugins::Lyphile::VLC::ControlLua->init;
 	Plugins::Lyphile::FFmpeg::Control->init;
 	Plugins::Lyphile::MPV::Control->init;
+	Plugins::Lyphile::StreamInfo->init;
 	Plugins::Lyphile::VLC::PlayerSettings->new;
 	Plugins::Lyphile::VLC::PlayerSettingsLua->new;
 	Plugins::Lyphile::MPV::PlayerSettings->new;

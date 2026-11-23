@@ -83,7 +83,7 @@ sub init {
 
 		Slim::Web::Pages->addPageFunction("plugins/Lyphile/vlc/$name", sub {
 			my ($client, $params, $callback, $httpClient, $httpResponse) = @_;
-			_send_json($httpClient, $httpResponse, $handler->($params));
+			return _send_json($httpClient, $httpResponse, $handler->($params));
 		});
 	}
 }
@@ -109,8 +109,11 @@ sub _onPlaylist {
 		my $paused = $request->getRequest(2);
 		$paused = $client->isPaused ? 1 : 0 unless defined $paused;
 
-		# oldrc "pause" toggles, so look at VLC's state first: 3 playing, 4 paused
-		my ($state) = (_command($sock, 'status', 1) // '') =~ /play state: (\d+)/;
+		# oldrc "pause" toggles, so look at VLC's state first: 3 playing, 4 paused. A paused VLC has no
+		# "play state" line in its answer to "status": it says "Type 'pause' to continue." instead
+		my $answer = _command($sock, 'status', 1) // '';
+		my ($state) = $answer =~ /play state: (\d+)/;
+		$state = 4 if !defined $state && $answer =~ /^Type 'pause' to continue\./m;
 		$state //= -1;
 
 		if (($paused && $state == 3) || (!$paused && $state == 4)) {
@@ -131,8 +134,9 @@ sub _send_json {
 	my $json = encode_json($data);
 	$httpResponse->code(RC_OK);
 	$httpResponse->content_type('application/json');
-	$httpResponse->content_length(length($json));
-	Slim::Web::HTTP::addHTTPResponse($httpClient, $httpResponse, \$json, undef, undef);
+	# the server sends the answer when the page function returns the reference to its body: sending it here as
+	# well would answer the next request of the connection twice
+	return \$json;
 }
 
 # Socket path of a player from its MAC address; undef for anything that is not a MAC address
@@ -173,6 +177,9 @@ sub _command {
 # VLC's states: 1 opening, 3 playing, 4 paused, 5 ended, 6 error
 sub _state_of {
 	my $status = shift // '';
+
+	# a paused VLC has no "play state" line in its answer, it says how to go on
+	return 'paused' if $status =~ /^Type 'pause' to continue\./m;
 
 	my ($n) = $status =~ /^status change: \( play state: (\d+) \)/m;
 	return '' unless defined $n;
