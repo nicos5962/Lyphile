@@ -1,6 +1,7 @@
 package Plugins::Lyphile::Settings;
 
 use strict;
+use URI;
 use warnings;
 use parent qw(Slim::Web::Settings);
 
@@ -112,8 +113,26 @@ sub logList {
 sub logHandler {
 	my ($client, $params, undef, $httpClient, $response) = @_;
 
+	# The viewer of the core sends its own requests (the form that refreshes the page every 10 s, the lines and search
+	# buttons: a POST; the Download link: a GET of the page without a query), and the server only passes the query
+	# of a GET to the page function. The player and the type are then taken from the address of the request, or from
+	# the page that sent it.
+	my ($mac, $type) = ($params->{mac}, $params->{type});
+
+	unless ($mac && $type) {
+		my $request = $response->request;
+
+		foreach my $url ($request && $request->uri, $request && $request->header('Referer')) {
+			next unless $url;
+
+			my %query = URI->new("$url")->query_form;
+			($mac, $type) = @query{qw(mac type)} if $query{mac} && $query{type};
+			last if $mac && $type;
+		}
+	}
+
 	# only files found by playerLogs() can be shown, nothing taken from the request is used as a path
-	my $entry = playerLogs()->{ ($params->{mac} || '') . '/' . ($params->{type} || '') };
+	my $entry = playerLogs()->{ ($mac || '') . '/' . ($type || '') };
 
 	return Slim::Web::Pages::Common->logFileViewer($client, $params, $httpClient, $response, $entry->{file})
 		if $entry;
@@ -122,7 +141,7 @@ sub logHandler {
 	# itself as well: the server sends what the function returns, so both together answer the next request of the
 	# connection with the wrong answer
 	$log->warn(sprintf("log page: no log for mac='%s' type='%s' (logs found: %s, dir: %s)",
-		$params->{mac} // '', $params->{type} // '', join(', ', sort keys %{ playerLogs() }) || 'none', Plugins::Lyphile::Plugin::logDir()));
+		$mac // '', $type // '', join(', ', sort keys %{ playerLogs() }) || 'none', Plugins::Lyphile::Plugin::logDir()));
 
 	my $body = 'Log not found';
 	$response->code(RC_NOT_FOUND);

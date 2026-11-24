@@ -40,6 +40,9 @@ Copy the `Lyphile` folder into the `Plugins` directory of the server cache (for 
 
 ## Changelog
 
+### 1.2
+- Bug fix: the log page of a player showed "Log not found" after about 10 seconds, when it refreshed itself, and for its lines, search and Download controls. The viewer of the core sends those as a POST or a link without the player and type, which the server does not pass on to the page. They are now taken from the address of the request or from the page that sent it.
+
 ### 1.1
 - Bug fix: the VLC player page no longer shows for a player set to "none" (it shows only for the `vlc-Player` helper).
 - Bug fix (VLC oldrc): a pause followed by a resume left VLC paused for good, so VLC, ffmpeg and the helper stayed running and the player page kept reporting "oldrc interface active" while another track played. A paused VLC is now recognised, so it resumes and is cleaned up.
@@ -53,7 +56,7 @@ Copy the `Lyphile` folder into the `Plugins` directory of the server cache (for 
 - First release.
 
 ## Version
-1.1
+1.2
 
 ## Author
 nicos
